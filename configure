@@ -235,6 +235,8 @@ for opt do
   ;;
   --disable-libzbc) libzbc="no"
   ;;
+  --disable-kinetic) kinetic="no"
+  ;;
   --disable-tcmalloc) disable_tcmalloc="yes"
   ;;
   --enable-libaio-uring) libaio_uring="yes"
@@ -280,6 +282,7 @@ if test "$show_help" = "yes" ; then
   echo "--enable-libiscsi       Enable iscsi support"
   echo "--enable-libnbd         Enable libnbd (NBD engine) support"
   echo "--disable-libzbc        Disable libzbc even if found"
+  echo "--disable-kinetic       Disable kinetic engine"
   echo "--disable-tcmalloc	Disable tcmalloc support"
   echo "--enable-libaio-uring   Enable libaio emulated over io_uring"
   echo "--dynamic-libengines	Lib-based ioengines as dynamic libraries"
@@ -1856,6 +1859,29 @@ print_config "rbd_poll" "$rbd_poll"
 fi
 
 ##########################################
+# check for kinetic
+if test "$kinetic" != "yes" ; then
+  kinetic="no"
+fi
+
+cat > $TMPC << EOF
+#include <kinetic/kinetic.h>
+int main(int argc, char **argv)
+{
+	extern char *ki_msgtype_label[];
+        char *s = ki_msgtype_label[0];
+        return(s?0:1);
+}
+EOF
+_KINLDLIBS="-lkinetic -lpthread -lssl -lcrypto"
+_KINLDFLAGS="-L../kinetic-prototype/build/lib"
+_KINCFLAGS="-I../kinetic-prototype/build/include"
+if compile_prog "$_KINCFLAGS" "$_KINLDFLAGS $_KINLDLIBS" "kinetic"; then
+  kinetic="yes"
+fi
+print_config "Kinetic engine" "$kinetic"
+
+##########################################
 # check for rbd_invalidate_cache()
 if test "$rbd_inval" != "yes" ; then
   rbd_inval="no"
@@ -2884,6 +2910,9 @@ if test "$rbd" = "yes" ; then
 fi
 if test "$rbd_poll" = "yes" ; then
   output_sym "CONFIG_RBD_POLL"
+fi
+if test "$kinetic" = "yes" ; then
+  output_sym "CONFIG_KINETIC"
 fi
 if test "$rbd_inval" = "yes" ; then
   output_sym "CONFIG_RBD_INVAL"
