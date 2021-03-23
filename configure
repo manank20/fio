@@ -1873,7 +1873,7 @@ int main(int argc, char **argv)
         return(s?0:1);
 }
 EOF
-_KINLDLIBS="-lkinetic -lpthread -lssl -lcrypto"
+_KINLDLIBS="-Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto"
 _KINLDFLAGS="-L../kinetic-prototype/build/lib"
 _KINCFLAGS="-I../kinetic-prototype/build/include"
 if compile_prog "$_KINCFLAGS" "$_KINLDFLAGS $_KINLDLIBS" "kinetic"; then

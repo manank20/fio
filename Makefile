@@ -193,10 +193,10 @@ ifdef CONFIG_LIBZBC
 endif
 ifdef CONFIG_KINETIC
   kinetic_SRCS = engines/kinetic.c
-  kinetic_LIBS = -lkinetic -lpthread -lssl -lcrypto
+  kinetic_LIBS = -Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto
   ENGINES += kinetic
-  LDFLAGS += -L../kinetic-prototype/build/lib
-  CFLAGS  += -I../kinetic-prototype/build/include
+  LDFLAGS += -L../libkinetic/build/lib
+  CFLAGS  += -I../libkinetic/build/include
 endif
 
 ifeq ($(CONFIG_TARGET_OS), Linux)
