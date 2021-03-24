@@ -15,6 +15,8 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <assert.h>
+#include <sys/types.h>
+#include <dirent.h>
 
 #include "fio.h"
 #include "diskutil.h"
@@ -91,8 +93,9 @@ static void *dlopen_external(struct thread_data *td, const char *engine)
 	char engine_path[PATH_MAX];
 	void *dlhandle;
 
-	sprintf(engine_path, "%s/lib%s.so", FIO_EXT_ENG_DIR, engine);
+	sprintf(engine_path, "%s/fio-%s.so", FIO_EXT_ENG_DIR, engine);
 
+	dprint(FD_IO, "dlopen external %s\n", engine_path);
 	dlhandle = dlopen(engine_path, RTLD_LAZY);
 	if (!dlhandle)
 		log_info("Engine %s not found; Either name is invalid, was not built, or fio-engine-%s package is missing.\n",
@@ -110,7 +113,11 @@ static struct ioengine_ops *dlopen_ioengine(struct thread_data *td,
 	struct ioengine_ops *ops;
 	void *dlhandle;
 
-	dprint(FD_IO, "dload engine %s\n", engine_lib);
+	if (!strncmp(engine_lib, "linuxaio", 8) ||
+	    !strncmp(engine_lib, "aio", 3))
+		engine_lib = "libaio";
+
+	dprint(FD_IO, "dlopen engine %s\n", engine_lib);
 
 	dlerror();
 	dlhandle = dlopen(engine_lib, RTLD_LAZY);
@@ -149,7 +156,7 @@ static struct ioengine_ops *dlopen_ioengine(struct thread_data *td,
 		return NULL;
 	}
 
-	td->io_ops_dlhandle = dlhandle;
+	ops->dlhandle = dlhandle;
 	return ops;
 }
 
@@ -158,7 +165,7 @@ static struct ioengine_ops *__load_ioengine(const char *engine)
 	/*
 	 * linux libaio has alias names, so convert to what we want
 	 */
-	if (!strncmp(engine, "linuxaio", 8)) {
+	if (!strncmp(engine, "linuxaio", 8) || !strncmp(engine, "aio", 3)) {
 		dprint(FD_IO, "converting ioengine name: %s -> libaio\n",
 		       engine);
 		engine = "libaio";
@@ -188,7 +195,9 @@ struct ioengine_ops *load_ioengine(struct thread_data *td)
 	 * so as not to break job files not using the prefix.
 	 */
 	ops = __load_ioengine(td->o.ioengine);
-	if (!ops)
+
+	/* We do re-dlopen existing handles, for reference counting */
+	if (!ops || ops->dlhandle)
 		ops = dlopen_ioengine(td, name);
 
 	/*
@@ -222,9 +231,10 @@ void free_ioengine(struct thread_data *td)
 		td->eo = NULL;
 	}
 
-	if (td->io_ops_dlhandle) {
-		dlclose(td->io_ops_dlhandle);
-		td->io_ops_dlhandle = NULL;
+	if (td->io_ops->dlhandle) {
+		dprint(FD_IO, "dlclose ioengine %s\n", td->io_ops->name);
+		dlclose(td->io_ops->dlhandle);
+		td->io_ops->dlhandle = NULL;
 	}
 
 	td->io_ops = NULL;
@@ -630,6 +640,34 @@ int td_io_get_file_size(struct thread_data *td, struct fio_file *f)
 	return td->io_ops->get_file_size(td, f);
 }
 
+#ifdef CONFIG_DYNAMIC_ENGINES
+/* Load all dynamic engines in FIO_EXT_ENG_DIR for enghelp command */
+static void
+fio_load_dynamic_engines(struct thread_data *td)
+{
+	DIR *dirhandle = NULL;
+	struct dirent *dirent = NULL;
+	char engine_path[PATH_MAX];
+
+	dirhandle = opendir(FIO_EXT_ENG_DIR);
+	if (!dirhandle)
+		return;
+
+	while ((dirent = readdir(dirhandle)) != NULL) {
+		if (!strcmp(dirent->d_name, ".") ||
+		    !strcmp(dirent->d_name, ".."))
+			continue;
+
+		sprintf(engine_path, "%s/%s", FIO_EXT_ENG_DIR, dirent->d_name);
+		dlopen_ioengine(td, engine_path);
+	}
+
+	closedir(dirhandle);
+}
+#else
+#define fio_load_dynamic_engines(td) do { } while (0)
+#endif
+
 int fio_show_ioengine_help(const char *engine)
 {
 	struct flist_head *entry;
@@ -638,8 +676,11 @@ int fio_show_ioengine_help(const char *engine)
 	char *sep;
 	int ret = 1;
 
+	memset(&td, 0, sizeof(struct thread_data));
+
 	if (!engine || !*engine) {
 		log_info("Available IO engines:\n");
+		fio_load_dynamic_engines(&td);
 		flist_for_each(entry, &engine_list) {
 			io_ops = flist_entry(entry, struct ioengine_ops, list);
 			log_info("\t%s\n", io_ops->name);
@@ -652,7 +693,6 @@ int fio_show_ioengine_help(const char *engine)
 		sep++;
 	}
 
-	memset(&td, 0, sizeof(struct thread_data));
 	td.o.ioengine = (char *)engine;
 	io_ops = load_ioengine(&td);
 

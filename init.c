@@ -45,13 +45,12 @@ const char fio_version_string[] = FIO_VERSION;
 #define FIO_RANDSEED		(0xb1899bedUL)
 
 static char **ini_file;
-static int max_jobs = FIO_MAX_JOBS;
 static bool dump_cmdline;
 static bool parse_only;
 static bool merge_blktrace_only;
 
 static struct thread_data def_thread;
-struct thread_data *threads = NULL;
+struct thread_segment segments[REAL_MAX_SEG];
 static char **job_sections;
 static int nr_job_sections;
 
@@ -301,25 +300,35 @@ static struct option l_opts[FIO_NR_OPTIONS] = {
 
 void free_threads_shm(void)
 {
-	if (threads) {
-		void *tp = threads;
-#ifndef CONFIG_NO_SHM
-		struct shmid_ds sbuf;
+	int i;
 
-		threads = NULL;
-		shmdt(tp);
-		shmctl(shm_id, IPC_RMID, &sbuf);
-		shm_id = -1;
+	for (i = 0; i < nr_segments; i++) {
+		struct thread_segment *seg = &segments[i];
+
+		if (seg->threads) {
+			void *tp = seg->threads;
+#ifndef CONFIG_NO_SHM
+			struct shmid_ds sbuf;
+
+			seg->threads = NULL;
+			shmdt(tp);
+			shmctl(seg->shm_id, IPC_RMID, &sbuf);
+			seg->shm_id = -1;
 #else
-		threads = NULL;
-		free(tp);
+			seg->threads = NULL;
+			free(tp);
 #endif
+		}
 	}
+
+	nr_segments = 0;
+	cur_segment = 0;
 }
 
 static void free_shm(void)
 {
-	if (threads) {
+#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+	if (nr_segments) {
 		flow_exit();
 		fio_debug_jobp = NULL;
 		fio_warned = NULL;
@@ -335,71 +344,80 @@ static void free_shm(void)
 	fio_filelock_exit();
 	file_hash_exit();
 	scleanup();
+#endif
 }
 
-/*
- * The thread area is shared between the main process and the job
- * threads/processes. So setup a shared memory segment that will hold
- * all the job info. We use the end of the region for keeping track of
- * open files across jobs, for file sharing.
- */
-static int setup_thread_area(void)
+static int add_thread_segment(void)
 {
+	struct thread_segment *seg = &segments[nr_segments];
+	size_t size = JOBS_PER_SEG * sizeof(struct thread_data);
 	int i;
 
-	if (threads)
-		return 0;
+	if (nr_segments + 1 >= REAL_MAX_SEG) {
+		log_err("error: maximum number of jobs reached.\n");
+		return -1;
+	}
 
-	/*
-	 * 1024 is too much on some machines, scale max_jobs if
-	 * we get a failure that looks like too large a shm segment
-	 */
-	do {
-		size_t size = max_jobs * sizeof(struct thread_data);
-
-		size += 2 * sizeof(unsigned int);
+	size += 2 * sizeof(unsigned int);
 
 #ifndef CONFIG_NO_SHM
-		shm_id = shmget(0, size, IPC_CREAT | 0600);
-		if (shm_id != -1)
-			break;
-		if (errno != EINVAL && errno != ENOMEM && errno != ENOSPC) {
+	seg->shm_id = shmget(0, size, IPC_CREAT | 0600);
+	if (seg->shm_id == -1) {
+		if (errno != EINVAL && errno != ENOMEM && errno != ENOSPC)
 			perror("shmget");
-			break;
-		}
+		return -1;
+	}
 #else
-		threads = malloc(size);
-		if (threads)
-			break;
+	seg->threads = malloc(size);
+	if (!seg->threads)
+		return -1;
 #endif
 
-		max_jobs >>= 1;
-	} while (max_jobs);
-
 #ifndef CONFIG_NO_SHM
-	if (shm_id == -1)
-		return 1;
-
-	threads = shmat(shm_id, NULL, 0);
-	if (threads == (void *) -1) {
+	seg->threads = shmat(seg->shm_id, NULL, 0);
+	if (seg->threads == (void *) -1) {
 		perror("shmat");
 		return 1;
 	}
 	if (shm_attach_to_open_removed())
-		shmctl(shm_id, IPC_RMID, NULL);
+		shmctl(seg->shm_id, IPC_RMID, NULL);
 #endif
 
-	memset(threads, 0, max_jobs * sizeof(struct thread_data));
-	for (i = 0; i < max_jobs; i++)
-		DRD_IGNORE_VAR(threads[i]);
-	fio_debug_jobp = (unsigned int *)(threads + max_jobs);
+	nr_segments++;
+
+	memset(seg->threads, 0, JOBS_PER_SEG * sizeof(struct thread_data));
+	for (i = 0; i < JOBS_PER_SEG; i++)
+		DRD_IGNORE_VAR(seg->threads[i]);
+	seg->nr_threads = 0;
+
+	/* Not first segment, we're done */
+	if (nr_segments != 1) {
+		cur_segment++;
+		return 0;
+	}
+
+	fio_debug_jobp = (unsigned int *)(seg->threads + JOBS_PER_SEG);
 	*fio_debug_jobp = -1;
 	fio_warned = fio_debug_jobp + 1;
 	*fio_warned = 0;
 
 	flow_init();
-
 	return 0;
+}
+
+/*
+ * The thread areas are shared between the main process and the job
+ * threads/processes, and is split into chunks of JOBS_PER_SEG. If the current
+ * segment has no more room, add a new chunk.
+ */
+static int expand_thread_area(void)
+{
+	struct thread_segment *seg = &segments[cur_segment];
+
+	if (nr_segments && seg->nr_threads < JOBS_PER_SEG)
+		return 0;
+
+	return add_thread_segment();
 }
 
 static void dump_print_option(struct print_option *p)
@@ -430,19 +448,6 @@ static void dump_opt_list(struct thread_data *td)
 	}
 }
 
-static void fio_dump_options_free(struct thread_data *td)
-{
-	while (!flist_empty(&td->opt_list)) {
-		struct print_option *p;
-
-		p = flist_first_entry(&td->opt_list, struct print_option, list);
-		flist_del_init(&p->list);
-		free(p->name);
-		free(p->value);
-		free(p);
-	}
-}
-
 static void copy_opt_list(struct thread_data *dst, struct thread_data *src)
 {
 	struct flist_head *entry;
@@ -470,21 +475,19 @@ static void copy_opt_list(struct thread_data *dst, struct thread_data *src)
 static struct thread_data *get_new_job(bool global, struct thread_data *parent,
 				       bool preserve_eo, const char *jobname)
 {
+	struct thread_segment *seg;
 	struct thread_data *td;
 
 	if (global)
 		return &def_thread;
-	if (setup_thread_area()) {
+	if (expand_thread_area()) {
 		log_err("error: failed to setup shm segment\n");
 		return NULL;
 	}
-	if (thread_number >= max_jobs) {
-		log_err("error: maximum number of jobs (%d) reached.\n",
-				max_jobs);
-		return NULL;
-	}
 
-	td = &threads[thread_number++];
+	seg = &segments[cur_segment];
+	td = &seg->threads[seg->nr_threads++];
+	thread_number++;
 	*td = *parent;
 
 	INIT_FLIST_HEAD(&td->opt_list);
@@ -534,7 +537,8 @@ static void put_job(struct thread_data *td)
 	if (td->o.name)
 		free(td->o.name);
 
-	memset(&threads[td->thread_number - 1], 0, sizeof(*td));
+	memset(td, 0, sizeof(*td));
+	segments[cur_segment].nr_threads--;
 	thread_number--;
 }
 
@@ -944,7 +948,9 @@ static int fixup_options(struct thread_data *td)
 	/*
 	 * Fix these up to be nsec internally
 	 */
-	o->max_latency *= 1000ULL;
+	for_each_rw_ddir(ddir)
+		o->max_latency[ddir] *= 1000ULL;
+
 	o->latency_target *= 1000ULL;
 
 	return ret;
@@ -956,13 +962,13 @@ static void init_rand_file_service(struct thread_data *td)
 	const unsigned int seed = td->rand_seeds[FIO_RAND_FILE_OFF];
 
 	if (td->o.file_service_type == FIO_FSERVICE_ZIPF) {
-		zipf_init(&td->next_file_zipf, nranges, td->zipf_theta, seed);
+		zipf_init(&td->next_file_zipf, nranges, td->zipf_theta, td->random_center, seed);
 		zipf_disable_hash(&td->next_file_zipf);
 	} else if (td->o.file_service_type == FIO_FSERVICE_PARETO) {
-		pareto_init(&td->next_file_zipf, nranges, td->pareto_h, seed);
+		pareto_init(&td->next_file_zipf, nranges, td->pareto_h, td->random_center, seed);
 		zipf_disable_hash(&td->next_file_zipf);
 	} else if (td->o.file_service_type == FIO_FSERVICE_GAUSS) {
-		gauss_init(&td->next_file_gauss, nranges, td->gauss_dev, seed);
+		gauss_init(&td->next_file_gauss, nranges, td->gauss_dev, td->random_center, seed);
 		gauss_disable_hash(&td->next_file_gauss);
 	}
 }
@@ -1087,18 +1093,15 @@ int ioengine_load(struct thread_data *td)
 		 * for this name and see if they match. If they do, then
 		 * the engine is unchanged.
 		 */
-		dlhandle = td->io_ops_dlhandle;
+		dlhandle = td->io_ops->dlhandle;
 		ops = load_ioengine(td);
 		if (!ops)
 			goto fail;
 
-		if (ops == td->io_ops && dlhandle == td->io_ops_dlhandle) {
-			if (dlhandle)
-				dlclose(dlhandle);
+		if (ops == td->io_ops && dlhandle == td->io_ops->dlhandle)
 			return 0;
-		}
 
-		if (dlhandle && dlhandle != td->io_ops_dlhandle)
+		if (dlhandle && dlhandle != td->io_ops->dlhandle)
 			dlclose(dlhandle);
 
 		/* Unload the old engine. */
@@ -1224,7 +1227,8 @@ enum {
 	FPRE_NONE = 0,
 	FPRE_JOBNAME,
 	FPRE_JOBNUM,
-	FPRE_FILENUM
+	FPRE_FILENUM,
+	FPRE_CLIENTUID
 };
 
 static struct fpre_keyword {
@@ -1235,6 +1239,7 @@ static struct fpre_keyword {
 	{ .keyword = "$jobname",	.key = FPRE_JOBNAME, },
 	{ .keyword = "$jobnum",		.key = FPRE_JOBNUM, },
 	{ .keyword = "$filenum",	.key = FPRE_FILENUM, },
+	{ .keyword = "$clientuid",	.key = FPRE_CLIENTUID, },
 	{ .keyword = NULL, },
 	};
 
@@ -1312,6 +1317,21 @@ static char *make_filename(char *buf, size_t buf_size,struct thread_options *o,
 				int ret;
 
 				ret = snprintf(dst, dst_left, "%d", filenum);
+				if (ret < 0)
+					break;
+				else if (ret > dst_left) {
+					log_err("fio: truncated filename\n");
+					dst += dst_left;
+					dst_left = 0;
+				} else {
+					dst += ret;
+					dst_left -= ret;
+				}
+				break;
+				}
+			case FPRE_CLIENTUID: {
+				int ret;
+				ret = snprintf(dst, dst_left, "%s", client_sockaddr_str);
 				if (ret < 0)
 					break;
 				else if (ret > dst_left) {
@@ -2722,12 +2742,7 @@ int parse_cmd_line(int argc, char *argv[], int client_type)
 			warnings_fatal = 1;
 			break;
 		case 'j':
-			max_jobs = atoi(optarg);
-			if (!max_jobs || max_jobs > REAL_MAX_JOBS) {
-				log_err("fio: invalid max jobs: %d\n", max_jobs);
-				do_exit++;
-				exit_val = 1;
-			}
+			/* we don't track/need this anymore, ignore it */
 			break;
 		case 'S':
 			did_arg = true;

@@ -143,6 +143,8 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 		o->rate_iops_min[i] = le32_to_cpu(top->rate_iops_min[i]);
 
 		o->perc_rand[i] = le32_to_cpu(top->perc_rand[i]);
+
+		o->max_latency[i] = le64_to_cpu(top->max_latency[i]);
 	}
 
 	o->ratecycle = le32_to_cpu(top->ratecycle);
@@ -203,12 +205,14 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	o->zipf_theta.u.f = fio_uint64_to_double(le64_to_cpu(top->zipf_theta.u.i));
 	o->pareto_h.u.f = fio_uint64_to_double(le64_to_cpu(top->pareto_h.u.i));
 	o->gauss_dev.u.f = fio_uint64_to_double(le64_to_cpu(top->gauss_dev.u.i));
+	o->random_center.u.f = fio_uint64_to_double(le64_to_cpu(top->random_center.u.i));
 	o->random_generator = le32_to_cpu(top->random_generator);
 	o->hugepage_size = le32_to_cpu(top->hugepage_size);
 	o->rw_min_bs = le64_to_cpu(top->rw_min_bs);
 	o->thinktime = le32_to_cpu(top->thinktime);
 	o->thinktime_spin = le32_to_cpu(top->thinktime_spin);
 	o->thinktime_blocks = le32_to_cpu(top->thinktime_blocks);
+	o->thinktime_blocks_type = le32_to_cpu(top->thinktime_blocks_type);
 	o->fsync_blocks = le32_to_cpu(top->fsync_blocks);
 	o->fdatasync_blocks = le32_to_cpu(top->fdatasync_blocks);
 	o->barrier_blocks = le32_to_cpu(top->barrier_blocks);
@@ -287,7 +291,6 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	o->sync_file_range = le32_to_cpu(top->sync_file_range);
 	o->latency_target = le64_to_cpu(top->latency_target);
 	o->latency_window = le64_to_cpu(top->latency_window);
-	o->max_latency = le64_to_cpu(top->max_latency);
 	o->latency_percentile.u.f = fio_uint64_to_double(le64_to_cpu(top->latency_percentile.u.i));
 	o->latency_run = le32_to_cpu(top->latency_run);
 	o->compress_percentage = le32_to_cpu(top->compress_percentage);
@@ -423,12 +426,14 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->zipf_theta.u.i = __cpu_to_le64(fio_double_to_uint64(o->zipf_theta.u.f));
 	top->pareto_h.u.i = __cpu_to_le64(fio_double_to_uint64(o->pareto_h.u.f));
 	top->gauss_dev.u.i = __cpu_to_le64(fio_double_to_uint64(o->gauss_dev.u.f));
+	top->random_center.u.i = __cpu_to_le64(fio_double_to_uint64(o->random_center.u.f));
 	top->random_generator = cpu_to_le32(o->random_generator);
 	top->hugepage_size = cpu_to_le32(o->hugepage_size);
 	top->rw_min_bs = __cpu_to_le64(o->rw_min_bs);
 	top->thinktime = cpu_to_le32(o->thinktime);
 	top->thinktime_spin = cpu_to_le32(o->thinktime_spin);
 	top->thinktime_blocks = cpu_to_le32(o->thinktime_blocks);
+	top->thinktime_blocks_type = __cpu_to_le32(o->thinktime_blocks_type);
 	top->fsync_blocks = cpu_to_le32(o->fsync_blocks);
 	top->fdatasync_blocks = cpu_to_le32(o->fdatasync_blocks);
 	top->barrier_blocks = cpu_to_le32(o->barrier_blocks);
@@ -487,7 +492,6 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->sync_file_range = cpu_to_le32(o->sync_file_range);
 	top->latency_target = __cpu_to_le64(o->latency_target);
 	top->latency_window = __cpu_to_le64(o->latency_window);
-	top->max_latency = __cpu_to_le64(o->max_latency);
 	top->latency_percentile.u.i = __cpu_to_le64(fio_double_to_uint64(o->latency_percentile.u.f));
 	top->latency_run = __cpu_to_le32(o->latency_run);
 	top->compress_percentage = cpu_to_le32(o->compress_percentage);
@@ -546,6 +550,8 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 		top->rate_iops_min[i] = cpu_to_le32(o->rate_iops_min[i]);
 
 		top->perc_rand[i] = cpu_to_le32(o->perc_rand[i]);
+
+		top->max_latency[i] = __cpu_to_le64(o->max_latency[i]);
 	}
 
 	memcpy(top->verify_pattern, o->verify_pattern, MAX_PATTERN_SIZE);

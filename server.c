@@ -950,7 +950,7 @@ static int handle_update_job_cmd(struct fio_net_cmd *cmd)
 		return 0;
 	}
 
-	td = &threads[tnumber - 1];
+	td = tnumber_to_td(tnumber);
 	convert_thread_options_to_cpu(&td->o, &pdu->top);
 	send_update_job_reply(cmd->tag, 0);
 	return 0;
@@ -1909,7 +1909,7 @@ static int fio_append_iolog_gz(struct sk_entry *first, struct io_log *log)
 			break;
 		}
 		flist_add_tail(&entry->list, &first->next);
-	} while (ret != Z_STREAM_END);
+	}
 
 	ret = deflateEnd(&stream);
 	if (ret == Z_OK)
