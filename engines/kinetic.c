@@ -819,12 +819,12 @@ FIO_STATIC struct ioengine_ops ioengine = {
 	.option_struct_size	= sizeof(struct kinetic_options),
 };
 
-static void fio_init fio_http_register(void)
+static void fio_init fio_kinetic_register(void)
 {
 	register_ioengine(&ioengine);
 }
 
-static void fio_exit fio_http_unregister(void)
+static void fio_exit fio_kinetic_unregister(void)
 {
 	unregister_ioengine(&ioengine);
 }

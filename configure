@@ -1907,8 +1907,8 @@ int main(int argc, char **argv)
 }
 EOF
 _KINLDLIBS="-Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto"
-_KINLDFLAGS="-L../kinetic-prototype/build/lib"
-_KINCFLAGS="-I../kinetic-prototype/build/include"
+_KINLDFLAGS="-L../libkinetic/build/lib"
+_KINCFLAGS="-I../libkinetic/build/include"
 if compile_prog "$_KINCFLAGS" "$_KINLDFLAGS $_KINLDLIBS" "kinetic"; then
   kinetic="yes"
 fi
