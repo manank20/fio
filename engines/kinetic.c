@@ -44,7 +44,19 @@
 static int 		ktd = -1;		/* Global kinetic descriptor */
 static klimits_t	kt_limits;		/* Recvd kinetic limits */
 static int		kt_jobs = 0;		/* Job counter */
-static int		kt_statprnted = 0;	/* Only print stats once */
+
+/*
+ * Since kinetic stats are per connection and one connection is being used
+ * for an fio run, meaningful Kinetic stats can only be done on group_reporting
+ * basis. So no matter if group_reporting is set or not the kinetic stats
+ * will be displayed and reset per group.  To do this we need to keep a count
+ * of the threads in a group. When the last thread leaves, we display and
+ * reset the kinetic stats. To simplify this engine only supports a fixed
+ * number of groups.
+ */
+#define KT_MAX_GID 1024
+static uint32_t		kt_gid_threads[KT_MAX_GID];
+
 
 /* Serialize cleanup with this mutex */
 static pthread_mutex_t	kt_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -429,9 +441,9 @@ fio_kinetic_prstats(struct thread_data *td,
 		return;
 
 	printf("KS [%s]: ", statname); /* grep-able prefix */
-	printf("%llu, %7u, %3.4g%%, %7u, %3.4g%%, %7u, %3.4g%%, %7u , ",
+	printf("%d, %7u, %3.4g%%, %7u, %3.4g%%, %7u, %3.4g%%, %7u , ",
 	       /* BS */
-	       td->o.bs[DDIR_WRITE],
+	       (int)kop->kop_vlen,
 	       /* OK */
 	       kop->kop_ok,
 	       /* OK % */
@@ -525,49 +537,69 @@ static void
 fio_kinetic_cleanup(struct thread_data *td)
 {
 	struct kinetic_data	*kd  = td->io_ops_data;
+	static int 		prhdr = 1;
 
 	if (!kd)
 		return;
 
 	pthread_mutex_lock(&kt_lock);
-	if (!kt_statprnted) {
+
+	/* Decrement the totals jobs */
+	kt_jobs--;
+
+	/* dec the thread count for the gid */
+	kt_gid_threads[td->groupid]--;
+
+	if (!kt_gid_threads[td->groupid]) {
+		/* Last thread in a group */
 		if (ki_getstats(ktd, kd->kd_kst) != K_OK) {
 			printf("Statistics failed\n");
 		}
 
-		printf("Job, BS, OK, %%, ");
-		printf("Failed, %%, Dropped, %%, Total,");
-		printf("Throughput(MiB/s), ");
-		printf("Mean Send Size(B), %% BS, ");
-		printf("Mean Recv Size B), %% BS, ");
-		printf("Mean Key Length(B), Mean Value Length(B), ");
-		printf("Mean RPC Time \xC2\xB5S, stddev, ");
-		printf("Mean Send Time \xC2\xB5S, stddev, %% of RPC, ");
-		printf("Mean Recv Time \xC2\xB5S, stddev, %% of RPC, ");
-		printf("Mean Server Time \xC2\xB5S, %% of RPC, \n");
+		if (prhdr) {
+			printf("Job, BS, OK, %%, ");
+			printf("Failed, %%, Dropped, %%, Total,");
+			printf("Throughput(MiB/s), ");
+			printf("Mean Send Size(B), %% BS, ");
+			printf("Mean Recv Size B), %% BS, ");
+			printf("Mean Key Length(B), Mean Value Length(B), ");
+			printf("Mean RPC Time \xC2\xB5S, stddev, ");
+			printf("Mean Send Time \xC2\xB5S, stddev, %% of RPC, ");
+			printf("Mean Recv Time \xC2\xB5S, stddev, %% of RPC, ");
+			printf("Mean Server Time \xC2\xB5S, %% of RPC, \n");
+			prhdr = 0;
+		}
 
 		fio_kinetic_prstats(td, &kd->kd_kst->kst_puts, "put");
 		fio_kinetic_prstats(td, &kd->kd_kst->kst_gets, "get");
 		fio_kinetic_prstats(td, &kd->kd_kst->kst_dels, "del");
 
-		/* Clear the stats */
+		/* Clear the stats for the next group */
 		memset(kd->kd_kst, 0, sizeof(*kd->kd_kst));
+
 		KIOP_SET((&kd->kd_kst->kst_puts), KOPF_TSTAT);
+		KIOP_SET((&kd->kd_kst->kst_gets), KOPF_TSTAT);
+		KIOP_SET((&kd->kd_kst->kst_dels), KOPF_TSTAT);
+
 		if (ki_putstats(ktd, kd->kd_kst) != K_OK) {
 			printf("Failed to enable Time Statistics\n");
 		}
-
-		ki_destroy(kd->kd_kst);
-		kt_statprnted=1;
 	}
 
-	if (kt_jobs == 1) {
+	/* Last job, kill the connection */
+	if ((kt_jobs == 0) && (ktd != -1)) {
 		ki_close(ktd);
 	}
 
-	kt_jobs--;
-
+	/* Free up the per job kinetic structures */
 	if (kd) {
+		/*
+		 * kst is per job but is only used by last group member
+		 * to cleanup. No matter what we need to destroy
+		 * it on every job completion.
+		 */
+		ki_destroy(kd->kd_kst);
+
 		if (kd->kd_prefix)	free(kd->kd_prefix);
 		if (kd->kd_pad)		free(kd->kd_pad);
 		free(kd);
@@ -587,7 +619,25 @@ fio_kinetic_setup(struct thread_data *td)
 	if (!td)
 		return(-1);
 
+	if (td->groupid > KT_MAX_GID) {
+		log_err("too many groups (<%d)\n", KT_MAX_GID);
+		return(-1);
+	}
+
+	/* Bump the number of jobs */
+	kt_jobs++;
+
+	/* bump the thread count for the gid */
+	kt_gid_threads[td->groupid]++;
+
+	if (o->verbose)
+		printf("Job [%u, %u, %u]: Setup\n",
+		       td->thread_number,
+		       td->subjob_number,
+		       td->groupid);
+
 	td->io_ops_data = NULL;
+
 	if (!td->o.use_thread) {
 		/* have a fork issue with the library, force threads for now */
 		log_err("--thread not set.\n");
@@ -608,8 +658,6 @@ fio_kinetic_setup(struct thread_data *td)
 
 		show_params=1; /* Only show the params once */
 	}
-
-	kt_jobs++;
 
 	/* Make sure keylen > MINKEY and < the max key length */
 	if (o->keylen < KINETIC_FIO_MINKEY) {
@@ -694,7 +742,7 @@ fio_kinetic_setup(struct thread_data *td)
 	kd->kd_prefixlen = sprintf(kd->kd_prefix, "%s%0*x%0*llx",
 				   KINETIC_FIO_PREFIX,
 				   KINETIC_FIO_KEYJOBLEN,
-				   ((o->jobinkey)?td->subjob_number:0),
+				   ((o->jobinkey)?td->thread_number:0),
 				   KINETIC_FIO_KEYBSLEN,
 				   td->o.bs[DDIR_READ]/KiB);
 
@@ -821,6 +869,7 @@ FIO_STATIC struct ioengine_ops ioengine = {
 
 static void fio_init fio_kinetic_register(void)
 {
+	memset(kt_gid_threads, 0, sizeof(*kt_gid_threads));
 	register_ioengine(&ioengine);
 }
 
