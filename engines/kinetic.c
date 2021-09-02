@@ -1,7 +1,17 @@
-/*
- * Kinetic IO Engine
+/**
+ * Copyright 2020-2021 Seagate Technology LLC.
  *
- * IO engine to perform Kinetic GET/PUT/DEL requests.
+ * This Source Code Form is subject to the terms of the Mozilla
+ * Public License, v. 2.0. If a copy of the MPL was not
+ * distributed with this file, You can obtain one at
+ * https://mozilla.org/MP:/2.0/.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but is provided AS-IS, WITHOUT ANY WARRANTY; including without
+ * the implied warranty of MERCHANTABILITY, NON-INFRINGEMENT or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the Mozilla Public
+ * License for more details.
+ *
  */
 #include <pthread.h>
 #include <time.h>
@@ -12,15 +22,35 @@
 #include <kinetic/kinetic.h>
 
 /*
- * Kinetic KV IO Engine.  This engine uses the various kinetic client libraries
- * to do IO, in the form of GET/PUT/DEL in place of R/W/T. It uses a network
- * connection to talk to a kinetic server. 
+ * Kinetic IO Sync and Async Engines
  *
+ * IO engines to perform Kinetic sync and async GET/PUT/DEL requests.
+ *
+ * This file defines two engines: 'kinetic' and 'kinetic-aio'.
+ * These engines uses the various kinetic client libraries to do IO,
+ * using KV GET/PUT/DEL in place of block IO R/W/T. It uses a network
+ * connection to talk to a kinetic server.  The 'kinetic' engine is a
+ * strictly synchronous engine and the 'kinetic-aio' is an asynchronous engine.
+ *
+ * Mapping a block io generator to KV has some caveats. Key values, unlike
+ * LBAs, do not exist until they are "put" or written, therefore, you cannot
+ * run read or trim tests until the key values are written.  So read or
+ * trim tests require that a write test be run first to prep the key values.
+ * Furthermore, since keys must be generated from block IO requests, two
+ * test's parameters (bs, jobs, io pattern, etc) could generate a different
+ * set of keys. So read test params should match the write test's params
+ * that was used to create key values. In the case of random read tests, the
+ * write prep must create all the possible keys needed. So a complete
+ * sequential write test should be run to create the entire offset space.
+ *
+ * Key Generation
  * The KV IO this engine generates keys from the IO request in the form of:
  *		"F:JJJBBBBOOOOOOOOOOO[....]"
  * Where,
+ *		F:	is literally "F:"
  *		JJJ	is a 3 char 0 padded ascii-hex representation of
- *			the job number, 4KiB jobs supported, can be forced to 0
+ *			the job number, 4KiB jobs are supported,
+ * 			can be forced to 0 by using kinetic_jobinkey=0
  *		BBBB	is a 4 char 0 padded ascii-hex representation of
  *			the block size in KiB, e.g 1MiB block size = 0400
  *			(64MiB - 1024) 1 KiB aligned block sizes supported
@@ -32,14 +62,70 @@
  * 			needed to get the key length to equal kinetic_keylen.
  * 			The minimum key is currently 20 bytes with no pad.
  *
- * Example invocation: ./fio --thread --ioengine=kinetic --name=seq-writer --iodepth=1 --rw=write --bs=32k --size=64m --numjobs=16 --kinetic_host=localhost --verify=crc32c [--verify_only] --verify_fatal=1 --exitall_on_error --group_reporting
-*/
+ * Usage Notes
+ * Currently using processes for threading is not supported in both engines
+ * due to limitations in the kinetic library, so thread=1 is required.
+ *
+ * The AIO engine can only support 1 job this is due to using a single
+ * connection to the kinetic server -- there is no way to differentiate
+ * events arising from different jobs on one connection. This means an
+ * actual completion for a job 0 IO will cause a competion event for both
+ * Job 0 and job 1, the latter will cause an error/segv.  A connection
+ * per job could get around this issue. Until then the AIO engine requires
+ * numjobs=1.
+ * 
+ * Because keys are block size dependent, block sizes must be uniform in a
+ * given test. So R/W/T blocks are checked to be the same. Blocks sizes
+ * also must be a multiple of 1KiB and no bigger than the maximum value size.
+ *
+ * Example invocation: ./fio --thread --numjobs=1 --ioengine=kinetic-aio --name=seq-writer --iodepth=32 --rw=write --bs=32k --size=64m --kinetic_host=localhost --verify=crc32c [--verify_only] --verify_fatal=1 --exitall_on_error --group_reporting
+ *
+ * Implementations Notes
+ * engines/skeleton_external.c  has the only documentation for FIO ioengines.
+ * It is weak.
+ *
+ * Common code
+ * This implementation of two io engines leverages probably 75% of the code
+ * across both engines. The options are used in both engines. For the most
+ * part ->setup and ->cleanup are common.  The key generation and KV
+ * setup code in ->queue are common. The KV stats is common.
+ *
+ * The engine design is probably not optimal, but given the lack of good docs
+ * at least it works somewhat. Here are some notes/questions:
+ *	o Code uses ->setup instead of ->init to validate parms, create
+ *	  thread/engine specific structures and connect to server.
+ *	o Matching threads, counted in ->setup and decremented in ->cleanup,
+ * 	  probably demonstrates a lack of understanding about the model.
+ *	o Could use ->prep instead of ->queue to create the KV and hang on io_u
+ *	o Should probably have a common complete routine that can be  used
+ * 	  by both engines.
+ *	o Should move to a connection per job to enable jobs in async engine.
+ *	o Should allow multiple connections per job to permit multipath tests.
+ * 	  Server interfaces can be determined by retrieving the kinetic
+ *	  servers configuration log.
+ *
+ * Sync Engine
+ * This engine really only uses ->setup, ->cleanup and ->queue.  It uses the
+ * standard sync calls in libkinetic ki_get, ki_put, and ki_del. Because
+ * the entire IO lifecycle is contained in ->queue there is no need for
+ * ->getevents, ->events, or per io_u engine data (->io_u_init or ->io_u_free)
+ *
+ * Async Engine
+ * IOs are setup and started in ->queue using libkinetics aio calls:
+ * ki_aio_get, ki_aio_put, and ki_aio_del. No contexts are used but the kv
+ * and resulting kio are hung on the io_u engine data structure. This
+ * structure is created in ->io_u_init and destroyed in ->io_u_free.
+ * Events are determined in ->getevents by calls to ki_poll and require a
+ * libkinetic in which ki_poll returns the number of ready KIOs (this is
+ * libkinetic with a hash later than 5a2eff19b912afb1ce723d5ff80ca015ebd984a9).
+ * KIOs are actually completed in ->event. By waiting to ->event to call
+ * ki_aio_complete, any io engine management of events is avoided, simplifying
+ * the code.  ->cancel is not supported.
+ */
 
-/* 
- * Start out with a single connection for this Sync engine. Each thread can
- * send concurrently on that connection. Eventually when async support is 
- * added a connection per thread/job can be added. 
- * Might want a boolean param kinetic_gcon (global connection) to control.
+/*
+ * To reduce resource pressure on the kinetic server these engines will use
+ * a single connection. Each thread can send concurrently on that connection.
  */
 static int 		ktd = -1;		/* Global kinetic descriptor */
 static klimits_t	kt_limits;		/* Recvd kinetic limits */
@@ -57,6 +143,9 @@ static int		kt_jobs = 0;		/* Job counter */
 #define KT_MAX_GID 1024
 static uint32_t		kt_gid_threads[KT_MAX_GID];
 
+#define KT_ENGINE "kinetic"
+#define KT_ENGINE_AIO "kinetic-aio"
+static int32_t kt_aio = -1; 		/* set in ->setup based on engine */
 
 /* Serialize cleanup with this mutex */
 static pthread_mutex_t	kt_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -75,7 +164,16 @@ struct kinetic_data {
 
 	kcachepolicy_t	kd_cpolicy;	/* Cache policy */
 	kstats_t 	*kd_kst;	/* Kinetic stats */
+};
 
+/*
+ * per IO data structure
+ */
+struct kinetic_io {
+	struct io_u	*ki_io_u;	/* FIO IO management structure */
+	kio_t		*ki_kio;	/* Kinetic IO structure */
+	kv_t		*ki_kv;		/* KV used in the IO */
+	int		ki_completed;	/* Completed flag */
 };
 
 /* Key Generation Limits that can impact FIO job definition */
@@ -91,10 +189,12 @@ struct kinetic_data {
 #define KINETIC_FIO_MAXOFFSET	0x100000000000	/* 17,592,186,044,416	16TiB */
 #define KiB 1024
 
+//#define KINETIC_DBG_IO		1
+
 struct kinetic_options {
 	void		*pad;   /* Required for fio */
-	char		*host;
-	char		*port;
+	char		*host;		/* Kinetic Server host or IP */
+	char		*port;		/* Kinetic Server port */
 	uint32_t	tls;
 	uint64_t	id;
 	char		*pass;
@@ -211,62 +311,63 @@ static struct fio_option options[] = {
 	},
 };
 
-#if 0
-static int
-fio_syncio_prep(struct thread_data *td, struct io_u *io_u)
-{
-	struct fio_file *f = io_u->file;
-
-	if (!ddir_rw(io_u->ddir))
-		return 0;
-
-	if (LAST_POS(f) != -1ULL && LAST_POS(f) == io_u->offset)
-		return 0;
-
-	if (lseek(f->fd, io_u->offset, SEEK_SET) == -1) {
-		td_verror(td, errno, "lseek");
-		return 1;
-	}
-
-	return 0;
-}
 
 static int
-fio_io_end(struct thread_data *td, struct io_u *io_u, int ret)
+fio_kinetic_io_create(struct thread_data *td, struct io_u *io_u)
 {
-	if (io_u->file && ret >= 0 && ddir_rw(io_u->ddir))
-		LAST_POS(io_u->file) = io_u->offset + ret;
+	struct kinetic_io *ki;
 
-	if (ret != (int) io_u->xfer_buflen) {
-		if (ret >= 0) {
-			io_u->resid = io_u->xfer_buflen - ret;
-			io_u->error = 0;
-			return FIO_Q_COMPLETED;
-		} else
-			io_u->error = errno;
-	}
+	ki = calloc(1, sizeof(struct kinetic_io));
+	if (!ki)
+		return(-1);
+	ki->ki_io_u = io_u;
 
-	if (io_u->error) {
-		io_u_log_error(td, io_u);
-		td_verror(td, io_u->error, "xfer");
-	}
-
-	return FIO_Q_COMPLETED;
+	io_u->engine_data = ki;
+	return(0);
 }
-#endif
+
+
+static void
+fio_kinetic_io_destroy(struct thread_data *td, struct io_u *io_u)
+{
+	struct kinetic_io *ki = io_u->engine_data;
+
+	if (ki) {
+		io_u->engine_data = NULL;
+		free(ki);
+	}
+}
+
 
 static enum fio_q_status
 fio_kinetic_queue(struct thread_data *td, struct io_u *io_u)
 {
-	char key_offset[KINETIC_FIO_KEYOFFLEN + 1];
- 
-	//struct kinetic_options	*o  = td->eo;
+	char 			*key_offset;
 	struct kinetic_data	*kd = td->io_ops_data;
-	kv_t		*kv = NULL;
-	struct kiovec	kv_key[3];
-	struct kiovec	kv_val[1]  = {{0, 0}};
-	kstatus_t 	kstatus;
-	
+	struct kinetic_io	*ki = io_u->engine_data;
+	kv_t			*kv = NULL;
+	struct kiovec		*kv_key;
+	struct kiovec		*kv_val;
+	kstatus_t 		kstatus;
+	kio_t 			*kio;
+#ifdef KINETIC_DBG_IO
+	static int 		wrq = 0;
+#endif
+	/*
+	 * Because ->queue is used by both sync and aio engines,
+	 * can't use the stack for kv_key, kv_val and key_offset,
+	 * as they need to live beyond ->queue in the aio case.
+	 * So allocate them here.
+	 */
+	kv_key = calloc(3, sizeof(struct kiovec));
+	kv_val = calloc(1, sizeof(struct kiovec));
+	key_offset = calloc(1, KINETIC_FIO_KEYOFFLEN + 1);
+	if (!kv_val || !kv_key || !key_offset) {
+		log_err("kv_key or kv_val alloc failed");
+		io_u->error = ENOMEM;
+		goto q_done;
+	}
+
 	/* Setup the offset portion of the key */
 	sprintf(key_offset, "%0*llx", (int)kd->kd_offsetlen, io_u->offset);
 
@@ -293,18 +394,24 @@ fio_kinetic_queue(struct thread_data *td, struct io_u *io_u)
 	kv->kv_val    = kv_val;
 	kv->kv_valcnt = 1;
 
+	io_u->error = 0;
+
 	switch (io_u->ddir) {
 	case DDIR_READ:
-#if 0
+#ifdef KINETIC_DBG_IO
 		printf("Get(\"%s%s%s\", %llx)\n",
 		       (char *)kv_key[0].kiov_base,
 		       (char *)kv_key[1].kiov_base,
 		       (char *)kv_key[2].kiov_base,
 		       io_u->xfer_buflen);
 #endif
-		
-		kstatus = ki_get(ktd, kv);
+		if (kt_aio)
+			kstatus = ki_aio_get(ktd, kv, NULL, &kio);
+		else
+			kstatus = ki_get(ktd, kv);
+
 		if (kstatus != K_OK) {
+			/* Common AIO and Sync error check */
 			printf("Get Failed(\"%s%s%s\")\n",
 			       (char *)kv_key[0].kiov_base,
 			       (char *)kv_key[1].kiov_base,
@@ -313,11 +420,21 @@ fio_kinetic_queue(struct thread_data *td, struct io_u *io_u)
 			perror("ki_get");
 			log_err("ki_get: failed: status code %d: %s\n",
 				kstatus, ki_error(kstatus));
+
+		} else if (kt_aio) {
+			/* if K_OK, AIO needs to set engine_data and bail */
+			ki->ki_kio = kio;
+			ki->ki_kv = kv;
+			ki->ki_completed = 0;
+
 		} else if (io_u->xfer_buflen != kv->kv_val[0].kiov_len) {
+			/* SYNC only partial value size mismatch */
 			io_u->error = EIO;
 			log_err("ki_get: failed: vallen != fio buffer len\n");
+
 		} else {
 			/*
+			 * SYNC only
 			 * No need to copy the value to the FIO structures
 			 * unless this is a verify.
 			 * Note this is a case where passing a buffer
@@ -332,6 +449,7 @@ fio_kinetic_queue(struct thread_data *td, struct io_u *io_u)
 		}
 
 #if 0
+		This should be above in the else case
 		hdr = (struct verify_header *)io_u->xfer_buf;
 		log_err("kinetic:%08lx: job    : %x\n", id, td->subjob_number);
 		log_err("kinetic:%08lx: kv_val : %p\n", id, kv.kv_val[0].kiov_base);
@@ -348,8 +466,8 @@ fio_kinetic_queue(struct thread_data *td, struct io_u *io_u)
 		break;
 
 	case DDIR_WRITE:
-#if 0
-		printf("Put(\"%s%s%s\", %llx)\n",
+#ifdef KINETIC_DBG_IO
+		printf("%d: Put(\"%s%s%s\", %llx)\n", wrq++,
 		       (char *)kv_key[0].kiov_base,
 		       (char *)kv_key[1].kiov_base,
 		       (char *)kv_key[2].kiov_base,
@@ -359,7 +477,11 @@ fio_kinetic_queue(struct thread_data *td, struct io_u *io_u)
 		kv_val[0].kiov_base = io_u->xfer_buf;
 		kv->kv_cpolicy      = kd->kd_cpolicy;
 
-		kstatus = ki_put(ktd, NULL, kv);
+		if (kt_aio)
+			kstatus = ki_aio_put(ktd, NULL, kv, NULL, &kio);
+		else
+			kstatus = ki_put(ktd, NULL, kv);
+
 		if (kstatus != K_OK) {
 			printf("Put failed (\"%s%s%s\")\n",
 			       (char *)kv_key[0].kiov_base,
@@ -369,12 +491,17 @@ fio_kinetic_queue(struct thread_data *td, struct io_u *io_u)
 			perror("ki_put");
 			log_err("ki_put: failed: status code %d: %s\n",
 				kstatus, ki_error(kstatus));
+		} else if (kt_aio) {
+			/* if K_OK, AIO needs to set engine_data and bail */
+			ki->ki_kio = kio;
+			ki->ki_kv = kv;
+			ki->ki_completed = 0;
 		}
 
 		break;
 
 	case DDIR_TRIM:
-#if 0
+#ifdef KINETIC_DBG_IO
 		printf("Del(\"%s%s%s\", %llx)\n",
 		       (char *)kv_key[0].kiov_base,
 		       (char *)kv_key[1].kiov_base,
@@ -385,12 +512,208 @@ fio_kinetic_queue(struct thread_data *td, struct io_u *io_u)
 		kv_val[0].kiov_base = io_u->xfer_buf;
 		kv->kv_cpolicy = kd->kd_cpolicy;
 		
-		kstatus = ki_del(ktd, NULL, kv);
+		if (kt_aio)
+			kstatus = ki_aio_del(ktd, NULL, kv, NULL, &kio);
+		else
+			kstatus = ki_del(ktd, NULL, kv);
+
 		if (kstatus != K_OK) {
 			printf("Del failed (\"%s%s%s\")\n",
 			       (char *)kv_key[0].kiov_base,
 			       (char *)kv_key[1].kiov_base,
 			       (char *)kv_key[2].kiov_base);
+
+			io_u->error = EIO;
+			log_err("ki_del: failed: status code %d %s\n",
+				kstatus, ki_error(kstatus));
+		}  else if (kt_aio) {
+			/* if K_OK, AIO needs to set engine_data and bail */
+			ki->ki_kio = kio;
+			ki->ki_kv = kv;
+			ki->ki_completed = 0;
+		}
+
+		break;
+
+	default:
+		//ret = do_io_u_sync(td, io_u);
+		printf("Queue: Why am I Here? \n");
+	}
+
+ q_done:
+	if (kt_aio && !io_u->error) {
+		return FIO_Q_QUEUED;
+	}
+
+	/* sync or error case, either way the kv is no longer needed */
+	if (key_offset) free(key_offset);
+	if (kv_key) free(kv_key);
+	if (kv_val) free(kv_val);
+	if (kv) ki_destroy(kv);
+	
+	return FIO_Q_COMPLETED;
+}
+
+
+static struct io_u *
+fio_kinetic_event(struct thread_data *td, int event)
+{
+	struct io_u 		*io_u;
+	struct kinetic_io	*ki = NULL;
+	kstatus_t		kstatus;
+	kv_t			*kv;
+	int			i, found;
+#ifdef KINETIC_DBG_IO
+	static int		wrc = 0;
+#endif
+	if (!kt_aio) {
+		/* sync IO engine - never any outstanding events */
+		printf("Event %d\n", event);
+		return NULL;
+	}
+
+	/*
+	 * Poll in ->getevents found a ready KIO. could be good or failed
+	 * either way call complete. In the case of error, the complete will
+	 * try to retrieve the failed KIO. Never look at passed in event as
+	 * the search for the io_u occurs here.
+	 */
+	found = 0;
+	io_u_qiter(&td->io_u_all, io_u, i) {
+		ki = io_u->engine_data;
+		if (!ki) {
+			printf("ERROR: No engine data before aio complete\n");
+			continue;
+		}
+
+		if (!(io_u->flags & IO_U_F_FLIGHT))
+			continue;
+
+		if (ki->ki_completed)
+			continue;
+
+		kstatus = ki_aio_complete(ktd, ki->ki_kio, NULL);
+		if (kstatus == K_EAGAIN) continue;
+
+		/* got one */
+		found=1;
+		break;
+	}
+
+	if (!found) {
+		printf("ERROR: No event\n");
+		return NULL;
+	}
+
+	/* Just checking.... should never get here */
+	if (!ki) {
+		printf("ERROR: No engine data\n");
+		return NULL;
+	}
+
+	/* Mark as completed */
+	ki->ki_completed = 1;
+
+	/* Grab a shorthand kv var */
+	kv =  ki->ki_kv;
+
+	/*
+	 *Process the completion, really on READ has something
+	 * meaningful todo
+	 */
+	switch (io_u->ddir) {
+	case DDIR_READ:
+#ifdef KINETIC_DBG_IO
+		printf("Get Complete(\"%s%s%s\", %llx)\n",
+		       (char *)kv->kv_key[0].kiov_base,
+		       (char *)kv->kv_key[1].kiov_base,
+		       (char *)kv->kv_key[2].kiov_base,
+		       io_u->xfer_buflen);
+#endif
+
+		if (kstatus != K_OK) {
+			printf("Get Failed(\"%s%s%s\")\n",
+			       (char *)kv->kv_key[0].kiov_base,
+			       (char *)kv->kv_key[1].kiov_base,
+			       (char *)kv->kv_key[2].kiov_base);
+			io_u->error = EIO;
+			perror("ki_get");
+			log_err("ki_get: failed: status code %d: %s\n",
+				kstatus, ki_error(kstatus));
+
+		} else if (io_u->xfer_buflen != kv->kv_val[0].kiov_len) {
+			/* SYNC only partial value size mismatch */
+			io_u->error = EIO;
+			log_err("ki_get: failed: vallen != fio buffer len\n");
+
+		} else {
+			/*
+			 * No need to copy the value to the FIO structures
+			 * unless this is a verify.
+			 * Note this is a case where passing a buffer
+			 * down into a get would be beneficial.
+			 */
+			if (td->o.do_verify) {
+				memcpy(io_u->xfer_buf, kv->kv_val[0].kiov_base,
+				       io_u->xfer_buflen);
+			}
+
+			free(kv->kv_val[0].kiov_base);
+		}
+
+#if 0
+		This verify debugging code should be above in the else case
+		hdr = (struct verify_header *)io_u->xfer_buf;
+		log_err("kinetic:%08lx: job    : %x\n", id, td->subjob_number);
+		log_err("kinetic:%08lx: kv_val : %p\n", id, kv.kv_val[0].kiov_base);
+		log_err("kinetic:%08lx: hdr    : %p\n", id, hdr);
+		log_err("kinetic:%08lx: Magic  : %04x\n", id, hdr->magic);
+		log_err("kinetic:%08lx: Type   : %04x\n", id, hdr->verify_type);
+		log_err("kinetic:%08lx: Offset : %016lx\n", id, hdr->offset);
+
+		if (io_u->offset != hdr->offset) {
+			log_err("kinetic FAIL:%08lx: HDROff %016lx: IOUOff: %016llx\n",
+				id, hdr->offset, io_u->offset);
+		}
+#endif
+		break;
+
+	case DDIR_WRITE:
+#ifdef KINETIC_DBG_IO
+		printf("%d: Complete(\"%s%s%s\", %llx)\n", wrc++,
+		       (char *)kv->kv_key[0].kiov_base,
+		       (char *)kv->kv_key[1].kiov_base,
+		       (char *)kv->kv_key[2].kiov_base,
+		       io_u->xfer_buflen);
+#endif
+
+		if (kstatus != K_OK) {
+			printf("Put failed (\"%s%s%s\")\n",
+			       (char *)kv->kv_key[0].kiov_base,
+			       (char *)kv->kv_key[1].kiov_base,
+			       (char *)kv->kv_key[2].kiov_base);
+			io_u->error = EIO;
+			perror("ki_put");
+			log_err("ki_put: failed: status code %d: %s\n",
+				kstatus, ki_error(kstatus));
+		}
+
+		break;
+
+	case DDIR_TRIM:
+#ifdef KINETIC_DBG_IO
+		printf("Del Complete(\"%s%s%s\", %llx)\n",
+		       (char *)kv->kv_key[0].kiov_base,
+		       (char *)kv->kv_key[1].kiov_base,
+		       (char *)kv->kv_key[2].kiov_base,
+		       io_u->xfer_buflen);
+#endif
+
+		if (kstatus != K_OK) {
+			printf("Del failed (\"%s%s%s\")\n",
+			       (char *)kv->kv_key[0].kiov_base,
+			       (char *)kv->kv_key[1].kiov_base,
+			       (char *)kv->kv_key[2].kiov_base);
 
 			io_u->error = EIO;
 			log_err("ki_del: failed: status code %d %s\n",
@@ -401,29 +724,73 @@ fio_kinetic_queue(struct thread_data *td, struct io_u *io_u)
 
 	default:
 		//ret = do_io_u_sync(td, io_u);
-		printf("Why am I Here? \n");
+		printf("Event: Why am I Here? \n");
 	}
 
- q_done:
-	if (kv) ki_destroy(kv);
-	return FIO_Q_COMPLETED;
-	
+	/*
+	 * Done with kv, so clean it up.  The KIO is managed by libkinetic
+	 * and is no longer valid, after ki_aio_complete.
+	 *
+	 * kv->kv_key[1].kiov_base is key_offset in ->queue
+	 */
+	if (kv->kv_key[1].kiov_base) free(kv->kv_key[1].kiov_base);
+	if (kv->kv_key) free(kv->kv_key);
+	if (kv->kv_val) free(kv->kv_val);
+	ki_destroy(kv);
+	ki->ki_kv = NULL;
+	ki->ki_kio = NULL;
+
+	return(io_u);
 }
 
-static struct io_u *
-fio_kinetic_event(struct thread_data *td, int event)
-{
-	/* sync IO engine - never any outstanding events */
-	printf("Events %d\n", event);
-	return NULL;
-}
 
 static int
 fio_kinetic_getevents(struct thread_data *td, unsigned int min,
 	unsigned int max, const struct timespec *t)
 {
-	/* sync IO engine - never any outstanding events */
-	return 0;
+	int ci;
+
+	if (!kt_aio) {
+		/* sync IO engine - never any outstanding events */
+		return 0;
+	}
+
+#ifdef KINETIC_DBG_IO
+	printf("GE: min=%u max=%u: ", min, max);
+#endif
+
+	/*
+	 * Want to do the completions in ->event, but to satisfy >=min
+	 * ki_poll should really return the number of ready kios. Until
+	 * then, iodepth_batch_complete_min will be treated as 1.
+	 * This routine will only find 1 event per call.
+	 */
+	do {
+		if ((ci = ki_poll(ktd, 100)) < 0)  {
+			/* Poll timed out, poll again */
+			if (errno == ETIMEDOUT)
+				continue;
+			if (errno == ECONNABORTED)
+				perror("fio_kinetic_getevents");
+		}
+
+		if (ci < min) {
+			/* this will be a tight loop waiting for the events */
+			continue;
+		}
+
+		/* got at least min events */
+		break;
+	} while (1);
+
+	/* Don't return too much */
+	ci = ((ci > max) ? max : ci);
+
+#ifdef KINETIC_DBG_IO
+	printf("ret=%d\n", ci);
+#endif
+
+	return (ci);
 }
 
 
@@ -605,8 +972,8 @@ fio_kinetic_cleanup(struct thread_data *td)
 		free(kd);
 	}
 	pthread_mutex_unlock(&kt_lock);
-
 }
+
 
 static int
 fio_kinetic_setup(struct thread_data *td)
@@ -622,6 +989,11 @@ fio_kinetic_setup(struct thread_data *td)
 	if (td->groupid > KT_MAX_GID) {
 		log_err("too many groups (<%d)\n", KT_MAX_GID);
 		return(-1);
+	}
+
+	/* Are we an AIO engine? initial -1 value means we only check once */
+	if (kt_aio < 0) {
+		kt_aio = (strcmp(KT_ENGINE_AIO, td->o.ioengine) == 0);
 	}
 
 	/* Bump the number of jobs */
@@ -685,15 +1057,25 @@ fio_kinetic_setup(struct thread_data *td)
 		goto cleanup;
 	}
 
+	/* Make sure bs is aligned, see the key generation notes for why */
 	if (td->o.bs[DDIR_READ] % KiB) {
 		log_err("blocksize must be a multiple of 1024\n");
 		goto cleanup;
 	}
 
-	/* Make sure the number of jobs is less than max jobs */
-	if (td->o.numjobs > KINETIC_FIO_MAXJOBS) {
-		log_err("numjobs too big (>%d)", KINETIC_FIO_MAXJOBS);
-		goto cleanup;
+	/* Check the number of jobs */
+	if (kt_aio) {
+		/* async engine */
+		if (td->o.numjobs != 1) {
+			log_err("numjobs too big (>%d) for aio", 1);
+			goto cleanup;
+		}
+	} else {
+		/* sync engine */
+		if (td->o.numjobs > KINETIC_FIO_MAXJOBS) {
+			log_err("numjobs too big (>%d)", KINETIC_FIO_MAXJOBS);
+			goto cleanup;
+		}
 	}
 
 	/* check size and filesize < KINETIC_FIO_MAXOFFSET */
@@ -833,11 +1215,13 @@ fio_kinetic_setup(struct thread_data *td)
 	return 1;
 }
 
+
 static int
 fio_kinetic_open(struct thread_data *td, struct fio_file *f)
 {
 	return 0;
 }
+
 
 static int
 fio_kinetic_close(struct thread_data *td, struct fio_file *f)
@@ -845,14 +1229,16 @@ fio_kinetic_close(struct thread_data *td, struct fio_file *f)
 	return 0;
 }
 
+
 static int
 fio_kinetic_invalidate(struct thread_data *td, struct fio_file *f)
 {
 	return 0;
 }
 
+
 FIO_STATIC struct ioengine_ops ioengine = {
-	.name			= "kinetic",
+	.name			= KT_ENGINE,
 	.version		= FIO_IOOPS_VERSION,
 	.flags			= FIO_DISKLESSIO | FIO_SYNCIO,
 	.queue			= fio_kinetic_queue,
@@ -867,13 +1253,47 @@ FIO_STATIC struct ioengine_ops ioengine = {
 	.option_struct_size	= sizeof(struct kinetic_options),
 };
 
+
 static void fio_init fio_kinetic_register(void)
 {
 	memset(kt_gid_threads, 0, sizeof(*kt_gid_threads));
 	register_ioengine(&ioengine);
 }
 
+
 static void fio_exit fio_kinetic_unregister(void)
 {
 	unregister_ioengine(&ioengine);
+}
+
+
+FIO_STATIC struct ioengine_ops aio_ioengine = {
+	.name			= KT_ENGINE_AIO,
+	.version		= FIO_IOOPS_VERSION,
+	.flags			= FIO_DISKLESSIO,
+	.queue			= fio_kinetic_queue,
+	.getevents		= fio_kinetic_getevents,
+	.event			= fio_kinetic_event,
+	.setup			= fio_kinetic_setup,
+	.cleanup		= fio_kinetic_cleanup,
+	.open_file		= fio_kinetic_open,
+	.close_file		= fio_kinetic_close,
+	.invalidate		= fio_kinetic_invalidate,
+	.io_u_init		= fio_kinetic_io_create,
+	.io_u_free		= fio_kinetic_io_destroy,
+	.options		= options,
+	.option_struct_size	= sizeof(struct kinetic_options),
+};
+
+
+static void fio_init fio_kinetic_aio_register(void)
+{
+	memset(kt_gid_threads, 0, sizeof(*kt_gid_threads));
+	register_ioengine(&aio_ioengine);
+}
+
+
+static void fio_exit fio_kinetic_aio_unregister(void)
+{
+	unregister_ioengine(&aio_ioengine);
 }
