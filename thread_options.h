@@ -31,10 +31,30 @@ enum fio_memtype {
 	MEM_CUDA_MALLOC,/* use GPU memory */
 };
 
+/*
+ * What mode to use for deduped data generation
+ */
+enum dedupe_mode {
+	DEDUPE_MODE_REPEAT = 0,
+	DEDUPE_MODE_WORKING_SET = 1,
+};
+
 #define ERROR_STR_MAX	128
 
 #define BSSPLIT_MAX	64
 #define ZONESPLIT_MAX	256
+
+struct split {
+	unsigned int nr;
+	unsigned long long val1[ZONESPLIT_MAX];
+	unsigned long long val2[ZONESPLIT_MAX];
+};
+
+struct split_prio {
+	uint64_t bs;
+	int32_t prio;
+	uint32_t perc;
+};
 
 struct bssplit {
 	uint64_t bs;
@@ -124,7 +144,7 @@ struct thread_options {
 	unsigned int do_verify;
 	unsigned int verify_interval;
 	unsigned int verify_offset;
-	char verify_pattern[MAX_PATTERN_SIZE];
+	char *verify_pattern;
 	unsigned int verify_pattern_bytes;
 	struct pattern_fmt verify_fmt[8];
 	unsigned int verify_fmt_sz;
@@ -152,6 +172,8 @@ struct thread_options {
 	unsigned int log_gz;
 	unsigned int log_gz_store;
 	unsigned int log_unix_epoch;
+	unsigned int log_alternate_epoch;
+	unsigned int log_alternate_epoch_clock_id;
 	unsigned int norandommap;
 	unsigned int softrandommap;
 	unsigned int bs_unaligned;
@@ -177,10 +199,6 @@ struct thread_options {
 
 	unsigned int hugepage_size;
 	unsigned long long rw_min_bs;
-	unsigned int thinktime;
-	unsigned int thinktime_spin;
-	unsigned int thinktime_blocks;
-	unsigned int thinktime_blocks_type;
 	unsigned int fsync_blocks;
 	unsigned int fdatasync_blocks;
 	unsigned int barrier_blocks;
@@ -238,11 +256,14 @@ struct thread_options {
 	unsigned int zero_buffers;
 	unsigned int refill_buffers;
 	unsigned int scramble_buffers;
-	char buffer_pattern[MAX_PATTERN_SIZE];
+	char *buffer_pattern;
 	unsigned int buffer_pattern_bytes;
 	unsigned int compress_percentage;
 	unsigned int compress_chunk;
 	unsigned int dedupe_percentage;
+	unsigned int dedupe_mode;
+	unsigned int dedupe_working_set_percentage;
+	unsigned int dedupe_global;
 	unsigned int time_based;
 	unsigned int disable_lat;
 	unsigned int disable_clat;
@@ -286,6 +307,12 @@ struct thread_options {
 	 */
 	char *exec_prerun;
 	char *exec_postrun;
+
+	unsigned int thinktime;
+	unsigned int thinktime_spin;
+	unsigned int thinktime_blocks;
+	unsigned int thinktime_blocks_type;
+	unsigned int thinktime_iotime;
 
 	uint64_t rate[DDIR_RWDIR_CNT];
 	uint64_t ratemin[DDIR_RWDIR_CNT];
@@ -355,8 +382,12 @@ struct thread_options {
 	unsigned int read_beyond_wp;
 	int max_open_zones;
 	unsigned int job_max_open_zones;
+	unsigned int ignore_zone_limits;
 	fio_fp64_t zrt;
 	fio_fp64_t zrf;
+
+	unsigned int log_entries;
+	unsigned int log_prio;
 };
 
 #define FIO_TOP_STR_MAX		256
@@ -433,7 +464,6 @@ struct thread_options_pack {
 	uint32_t do_verify;
 	uint32_t verify_interval;
 	uint32_t verify_offset;
-	uint8_t verify_pattern[MAX_PATTERN_SIZE];
 	uint32_t verify_pattern_bytes;
 	uint32_t verify_fatal;
 	uint32_t verify_dump;
@@ -460,6 +490,8 @@ struct thread_options_pack {
 	uint32_t log_gz;
 	uint32_t log_gz_store;
 	uint32_t log_unix_epoch;
+	uint32_t log_alternate_epoch;
+	uint32_t log_alternate_epoch_clock_id;
 	uint32_t norandommap;
 	uint32_t softrandommap;
 	uint32_t bs_unaligned;
@@ -485,10 +517,6 @@ struct thread_options_pack {
 
 	uint32_t hugepage_size;
 	uint64_t rw_min_bs;
-	uint32_t thinktime;
-	uint32_t thinktime_spin;
-	uint32_t thinktime_blocks;
-	uint32_t thinktime_blocks_type;
 	uint32_t fsync_blocks;
 	uint32_t fdatasync_blocks;
 	uint32_t barrier_blocks;
@@ -543,11 +571,13 @@ struct thread_options_pack {
 	uint32_t zero_buffers;
 	uint32_t refill_buffers;
 	uint32_t scramble_buffers;
-	uint8_t buffer_pattern[MAX_PATTERN_SIZE];
 	uint32_t buffer_pattern_bytes;
 	uint32_t compress_percentage;
 	uint32_t compress_chunk;
 	uint32_t dedupe_percentage;
+	uint32_t dedupe_mode;
+	uint32_t dedupe_working_set_percentage;
+	uint32_t dedupe_global;
 	uint32_t time_based;
 	uint32_t disable_lat;
 	uint32_t disable_clat;
@@ -566,6 +596,7 @@ struct thread_options_pack {
 	uint32_t lat_percentiles;
 	uint32_t slat_percentiles;
 	uint32_t percentile_precision;
+	uint32_t pad5;
 	fio_fp64_t percentile_list[FIO_IO_U_LIST_MAX_LEN];
 
 	uint8_t read_iolog_file[FIO_TOP_STR_MAX];
@@ -590,6 +621,12 @@ struct thread_options_pack {
 	 */
 	uint8_t exec_prerun[FIO_TOP_STR_MAX];
 	uint8_t exec_postrun[FIO_TOP_STR_MAX];
+
+	uint32_t thinktime;
+	uint32_t thinktime_spin;
+	uint32_t thinktime_blocks;
+	uint32_t thinktime_blocks_type;
+	uint32_t thinktime_iotime;
 
 	uint64_t rate[DDIR_RWDIR_CNT];
 	uint64_t ratemin[DDIR_RWDIR_CNT];
@@ -630,7 +667,6 @@ struct thread_options_pack {
 	uint64_t latency_target;
 	uint64_t latency_window;
 	uint64_t max_latency[DDIR_RWDIR_CNT];
-	uint32_t pad5;
 	fio_fp64_t latency_percentile;
 	uint32_t latency_run;
 
@@ -656,11 +692,36 @@ struct thread_options_pack {
 	uint32_t allow_mounted_write;
 
 	uint32_t zone_mode;
+	int32_t max_open_zones;
+	uint32_t ignore_zone_limits;
+
+	uint32_t log_entries;
+	uint32_t log_prio;
+
+	/*
+	 * verify_pattern followed by buffer_pattern from the unpacked struct
+	 */
+	uint8_t patterns[];
 } __attribute__((packed));
 
-extern void convert_thread_options_to_cpu(struct thread_options *o, struct thread_options_pack *top);
+extern int convert_thread_options_to_cpu(struct thread_options *o,
+		struct thread_options_pack *top, size_t top_sz);
+extern size_t thread_options_pack_size(struct thread_options *o);
 extern void convert_thread_options_to_net(struct thread_options_pack *top, struct thread_options *);
 extern int fio_test_cconv(struct thread_options *);
 extern void options_default_fill(struct thread_options *o);
+
+typedef int (split_parse_fn)(struct thread_options *, void *,
+			     enum fio_ddir, char *, bool);
+
+extern int str_split_parse(struct thread_data *td, char *str,
+			   split_parse_fn *fn, void *eo, bool data);
+
+extern int split_parse_ddir(struct thread_options *o, struct split *split,
+			    char *str, bool absolute, unsigned int max_splits);
+
+extern int split_parse_prio_ddir(struct thread_options *o,
+				 struct split_prio **entries, int *nr_entries,
+				 char *str);
 
 #endif

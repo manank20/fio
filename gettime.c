@@ -313,7 +313,7 @@ static int calibrate_cpu_clock(void)
 
 	max_ticks = MAX_CLOCK_SEC * cycles_per_msec * 1000ULL;
 	max_mult = ULLONG_MAX / max_ticks;
-	dprint(FD_TIME, "\n\nmax_ticks=%llu, __builtin_clzll=%d, "
+	dprint(FD_TIME, "max_ticks=%llu, __builtin_clzll=%d, "
 			"max_mult=%llu\n", max_ticks,
 			__builtin_clzll(max_ticks), max_mult);
 
@@ -335,7 +335,7 @@ static int calibrate_cpu_clock(void)
 
 	/*
 	 * Find the greatest power of 2 clock ticks that is less than the
-	 * ticks in MAX_CLOCK_SEC_2STAGE
+	 * ticks in MAX_CLOCK_SEC
 	 */
 	max_cycles_shift = max_cycles_mask = 0;
 	tmp = MAX_CLOCK_SEC * 1000ULL * cycles_per_msec;
@@ -431,22 +431,22 @@ void fio_clock_init(void)
 
 uint64_t ntime_since(const struct timespec *s, const struct timespec *e)
 {
-       int64_t sec, nsec;
+	int64_t sec, nsec;
 
-       sec = e->tv_sec - s->tv_sec;
-       nsec = e->tv_nsec - s->tv_nsec;
-       if (sec > 0 && nsec < 0) {
-	       sec--;
-	       nsec += 1000000000LL;
-       }
+	sec = e->tv_sec - s->tv_sec;
+	nsec = e->tv_nsec - s->tv_nsec;
+	if (sec > 0 && nsec < 0) {
+		sec--;
+		nsec += 1000000000LL;
+	}
 
        /*
 	* time warp bug on some kernels?
 	*/
-       if (sec < 0 || (sec == 0 && nsec < 0))
-	       return 0;
+	if (sec < 0 || (sec == 0 && nsec < 0))
+		return 0;
 
-       return nsec + (sec * 1000000000LL);
+	return nsec + (sec * 1000000000LL);
 }
 
 uint64_t ntime_since_now(const struct timespec *s)
@@ -671,12 +671,21 @@ static int clock_cmp(const void *p1, const void *p2)
 int fio_monotonic_clocktest(int debug)
 {
 	struct clock_thread *cthreads;
-	unsigned int nr_cpus = cpus_online();
+	unsigned int seen_cpus, nr_cpus = cpus_configured();
 	struct clock_entry *entries;
 	unsigned long nr_entries, tentries, failed = 0;
 	struct clock_entry *prev, *this;
 	uint32_t seq = 0;
 	unsigned int i;
+	os_cpu_mask_t mask;
+
+#ifdef FIO_HAVE_GET_THREAD_AFFINITY
+	fio_get_thread_affinity(mask);
+#else
+	memset(&mask, 0, sizeof(mask));
+	for (i = 0; i < nr_cpus; i++)
+		fio_cpu_set(&mask, i);
+#endif
 
 	if (debug) {
 		log_info("cs: reliable_tsc: %s\n", tsc_reliable ? "yes" : "no");
@@ -703,25 +712,31 @@ int fio_monotonic_clocktest(int debug)
 	if (debug)
 		log_info("cs: Testing %u CPUs\n", nr_cpus);
 
+	seen_cpus = 0;
 	for (i = 0; i < nr_cpus; i++) {
 		struct clock_thread *t = &cthreads[i];
 
+		if (!fio_cpu_isset(&mask, i))
+			continue;
 		t->cpu = i;
 		t->debug = debug;
 		t->seq = &seq;
 		t->nr_entries = nr_entries;
-		t->entries = &entries[i * nr_entries];
+		t->entries = &entries[seen_cpus * nr_entries];
 		__fio_sem_init(&t->lock, FIO_SEM_LOCKED);
 		if (pthread_create(&t->thread, NULL, clock_thread_fn, t)) {
 			failed++;
 			nr_cpus = i;
 			break;
 		}
+		seen_cpus++;
 	}
 
 	for (i = 0; i < nr_cpus; i++) {
 		struct clock_thread *t = &cthreads[i];
 
+		if (!fio_cpu_isset(&mask, i))
+			continue;
 		fio_sem_up(&t->lock);
 	}
 
@@ -729,6 +744,8 @@ int fio_monotonic_clocktest(int debug)
 		struct clock_thread *t = &cthreads[i];
 		void *ret;
 
+		if (!fio_cpu_isset(&mask, i))
+			continue;
 		pthread_join(t->thread, &ret);
 		if (ret)
 			failed++;
@@ -742,6 +759,7 @@ int fio_monotonic_clocktest(int debug)
 		goto err;
 	}
 
+	tentries = nr_entries * seen_cpus;
 	qsort(entries, tentries, sizeof(struct clock_entry), clock_cmp);
 
 	/* silence silly gcc */

@@ -44,7 +44,7 @@
 #define fio_swap64(x)	_byteswap_uint64(x)
 
 #define _SC_PAGESIZE			0x1
-#define _SC_NPROCESSORS_ONLN	0x2
+#define _SC_NPROCESSORS_CONF	0x2
 #define _SC_PHYS_PAGES			0x4
 
 #define SA_RESTART	0
@@ -77,6 +77,7 @@
 #define SIGCONT	0
 #define SIGUSR1	1
 #define SIGUSR2 2
+#define SIGKILL 15 /* SIGKILL doesn't exists, let's use SIGTERM */
 
 typedef int sigset_t;
 typedef int siginfo_t;
@@ -109,6 +110,8 @@ int nanosleep(const struct timespec *rqtp, struct timespec *rmtp);
 ssize_t pread(int fildes, void *buf, size_t nbyte, off_t offset);
 ssize_t pwrite(int fildes, const void *buf, size_t nbyte,
 		off_t offset);
+HANDLE windows_handle_connection(HANDLE hjob, int sk);
+HANDLE windows_create_job(void);
 
 static inline int blockdev_size(struct fio_file *f, unsigned long long *bytes)
 {
@@ -215,9 +218,6 @@ static inline int fio_mkdir(const char *path, mode_t mode) {
 
 	return 0;
 }
-
-#define FIO_HAVE_CPU_ONLINE_SYSCONF
-unsigned int cpus_online(void);
 
 int first_set_cpu(os_cpu_mask_t *cpumask);
 int fio_setaffinity(int pid, os_cpu_mask_t cpumask);

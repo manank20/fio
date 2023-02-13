@@ -917,9 +917,11 @@ int verify_io_u(struct thread_data *td, struct io_u **io_u_ptr)
 		hdr = p;
 
 		/*
-		 * Make rand_seed check pass when have verify_backlog.
+		 * Make rand_seed check pass when have verify_backlog or
+		 * zone reset frequency for zonemode=zbd.
 		 */
-		if (!td_rw(td) || (td->flags & TD_F_VER_BACKLOG))
+		if (!td_rw(td) || (td->flags & TD_F_VER_BACKLOG) ||
+		    td->o.zrf.u.f)
 			io_u->rand_seed = hdr->rand_seed;
 
 		if (td->o.verify != VERIFY_PATTERN_NO_HDR) {
@@ -1287,8 +1289,6 @@ void populate_verify_io_u(struct thread_data *td, struct io_u *io_u)
 	if (td->o.verify == VERIFY_NULL)
 		return;
 
-	io_u->numberio = td->io_issues[io_u->ddir];
-
 	fill_pattern_headers(td, io_u, 0, 0);
 }
 
@@ -1411,7 +1411,6 @@ static void *verify_async_thread(void *data)
 			ret = pthread_cond_wait(&td->verify_cond,
 							&td->io_u_lock);
 			if (ret) {
-				pthread_mutex_unlock(&td->io_u_lock);
 				break;
 			}
 		}

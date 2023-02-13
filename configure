@@ -116,6 +116,10 @@ has() {
   type "$1" >/dev/null 2>&1
 }
 
+num() {
+  echo "$1" | grep -E -q "^[0-9]+$"
+}
+
 check_define() {
   cat > $TMPC <<EOF
 #if !defined($1)
@@ -142,7 +146,7 @@ check_min_lib_version() {
   fi
   : "${_feature:=${1}}"
   if "${cross_prefix}"pkg-config --version > /dev/null 2>&1; then
-    if eval "echo \$$_feature" = "yes" ; then
+    if test "$(eval echo \"\$$_feature\")" = "yes" ; then
       feature_not_found "$_feature" "$1 >= $2"
     fi
   else
@@ -170,8 +174,12 @@ disable_native="no"
 march_set="no"
 libiscsi="no"
 libnbd="no"
+libnfs=""
+xnvme=""
+libblkio=""
 libzbc=""
 dfs=""
+seed_buckets=""
 dynamic_engines="no"
 prefix=/usr/local
 
@@ -241,11 +249,23 @@ for opt do
   ;;
   --disable-kinetic) kinetic="no"
   ;;
+  --disable-xnvme) xnvme="no"
+  ;;
+  --disable-libblkio) libblkio="no"
+  ;;
   --disable-tcmalloc) disable_tcmalloc="yes"
+  ;;
+  --disable-libnfs) libnfs="no"
+  ;;
+  --enable-libnfs) libnfs="yes"
   ;;
   --dynamic-libengines) dynamic_engines="yes"
   ;;
   --disable-dfs) dfs="no"
+  ;;
+  --enable-asan) asan="yes"
+  ;;
+  --seed-buckets=*) seed_buckets="$optarg"
   ;;
   --help)
     show_help="yes"
@@ -275,6 +295,8 @@ if test "$show_help" = "yes" ; then
   echo "--disable-http          Disable HTTP support even if found"
   echo "--disable-gfapi         Disable gfapi"
   echo "--enable-libhdfs        Enable hdfs support"
+  echo "--enable-libnfs         Enable nfs support"
+  echo "--disable-libnfs        Disable nfs support"
   echo "--disable-lex           Disable use of lex/yacc for math"
   echo "--disable-pmem          Disable pmem based engines even if found"
   echo "--enable-lex            Enable use of lex/yacc for math"
@@ -286,11 +308,16 @@ if test "$show_help" = "yes" ; then
   echo "--with-ime=             Install path for DDN's Infinite Memory Engine"
   echo "--enable-libiscsi       Enable iscsi support"
   echo "--enable-libnbd         Enable libnbd (NBD engine) support"
+  echo "--disable-xnvme         Disable xnvme support even if found"
+  echo "--disable-libblkio      Disable libblkio support even if found"
   echo "--disable-libzbc        Disable libzbc even if found"
   echo "--disable-kinetic       Disable kinetic engine"
-  echo "--disable-tcmalloc	Disable tcmalloc support"
-  echo "--dynamic-libengines	Lib-based ioengines as dynamic libraries"
-  echo "--disable-dfs		Disable DAOS File System support even if found"
+  echo "--disable-tcmalloc      Disable tcmalloc support"
+  echo "--dynamic-libengines    Lib-based ioengines as dynamic libraries"
+  echo "--disable-dfs           Disable DAOS File System support even if found"
+  echo "--enable-asan           Enable address sanitizer"
+  echo "--seed-buckets=         Number of seed buckets for the refill-buffer"
+>>>>>>> upstream/master
   exit $exit_val
 fi
 
@@ -421,6 +448,7 @@ CYGWIN*)
   clock_monotonic="yes"
   sched_idle="yes"
   pthread_condattr_setclock="no"
+  pthread_affinity="no"
   ;;
 esac
 
@@ -643,6 +671,25 @@ fi
 print_config "zlib" "$zlib"
 
 ##########################################
+# fcntl(F_FULLFSYNC) support
+if test "$fcntl_sync" != "yes" ; then
+  fcntl_sync="no"
+fi
+cat > $TMPC << EOF
+#include <unistd.h>
+#include <fcntl.h>
+
+int main(int argc, char **argv)
+{
+  return fcntl(0, F_FULLFSYNC);
+}
+EOF
+if compile_prog "" "" "fcntl(F_FULLFSYNC)" ; then
+    fcntl_sync="yes"
+fi
+print_config "fcntl(F_FULLFSYNC)" "$fcntl_sync"
+
+##########################################
 # linux-aio probe
 if test "$libaio" != "yes" ; then
   libaio="no"
@@ -807,6 +854,29 @@ fi
 print_config "pthread_sigmask()" "$pthread_sigmask"
 
 ##########################################
+# pthread_getaffinity_np() probe
+if test "$pthread_getaffinity" != "yes" ; then
+  pthread_getaffinity="no"
+fi
+cat > $TMPC <<EOF
+#include <stddef.h> /* NULL */
+#include <signal.h> /* pthread_sigmask() */
+#include <pthread.h>
+int main(void)
+{
+  cpu_set_t set;
+  return pthread_getaffinity_np(pthread_self(), sizeof(set), &set);
+}
+EOF
+if compile_prog "" "$LIBS" "pthread_getaffinity" ; then
+  pthread_getaffinity="yes"
+elif compile_prog "" "$LIBS -lpthread" "pthread_getaffinity" ; then
+  pthread_getaffinity="yes"
+  LIBS="$LIBS -lpthread"
+fi
+print_config "pthread_getaffinity_np()" "$pthread_getaffinity"
+
+##########################################
 # solaris aio probe
 if test "$solaris_aio" != "yes" ; then
   solaris_aio="no"
@@ -929,17 +999,16 @@ print_config "rdmacm" "$rdmacm"
 
 ##########################################
 # librpma probe
+# The librpma engines require librpma>=v0.11.0 with rpma_cq_get_wc().
 if test "$librpma" != "yes" ; then
   librpma="no"
 fi
 cat > $TMPC << EOF
-#include <stdio.h>
 #include <librpma.h>
-int main(int argc, char **argv)
+int main(void)
 {
-  enum rpma_conn_event event = RPMA_CONN_REJECTED;
-  (void) event; /* unused */
-  rpma_log_set_threshold(RPMA_LOG_THRESHOLD, RPMA_LOG_LEVEL_INFO);
+  void *ptr = rpma_cq_get_wc;
+  (void) ptr; /* unused */
   return 0;
 }
 EOF
@@ -1077,7 +1146,8 @@ cat > $TMPC << EOF
 #include <sched.h>
 int main(int argc, char **argv)
 {
-  cpu_set_t mask;
+  cpu_set_t mask = { };
+
   return sched_setaffinity(0, sizeof(mask), &mask);
 }
 EOF
@@ -1088,7 +1158,8 @@ else
 #include <sched.h>
 int main(int argc, char **argv)
 {
-  cpu_set_t mask;
+  cpu_set_t mask = { };
+
   return sched_setaffinity(0, &mask);
 }
 EOF
@@ -1109,7 +1180,9 @@ cat > $TMPC << EOF
 #include <time.h>
 int main(int argc, char **argv)
 {
-  return clock_gettime(0, NULL);
+  struct timespec ts;
+
+  return clock_gettime(0, &ts);
 }
 EOF
 if compile_prog "" "" "clock_gettime"; then
@@ -1131,7 +1204,9 @@ if test "$clock_gettime" = "yes" ; then
 #include <time.h>
 int main(int argc, char **argv)
 {
-  return clock_gettime(CLOCK_MONOTONIC, NULL);
+  struct timespec ts;
+
+  return clock_gettime(CLOCK_MONOTONIC, &ts);
 }
 EOF
   if compile_prog "" "$LIBS" "clock monotonic"; then
@@ -1570,7 +1645,8 @@ cat > $TMPC << EOF
 #include <sched.h>
 int main(int argc, char **argv)
 {
-  struct sched_param p;
+  struct sched_param p = { };
+
   return sched_setscheduler(0, SCHED_IDLE, &p);
 }
 EOF
@@ -1692,7 +1768,9 @@ cat > $TMPC << EOF
 #include <sys/uio.h>
 int main(int argc, char **argv)
 {
-  return pwritev(0, NULL, 1, 0) + preadv(0, NULL, 1, 0);
+  struct iovec iov[1] = { };
+
+  return pwritev(0, iov, 1, 0) + preadv(0, iov, 1, 0);
 }
 EOF
 if compile_prog "" "" "pwritev"; then
@@ -1710,7 +1788,9 @@ cat > $TMPC << EOF
 #include <sys/uio.h>
 int main(int argc, char **argv)
 {
-  return pwritev2(0, NULL, 1, 0, 0) + preadv2(0, NULL, 1, 0, 0);
+  struct iovec iov[1] = { };
+
+  return pwritev2(0, iov, 1, 0, 0) + preadv2(0, iov, 1, 0, 0);
 }
 EOF
 if compile_prog "" "" "pwritev2"; then
@@ -1736,14 +1816,14 @@ cat > $TMPC << EOF
 #include <stdio.h>
 int main(int argc, char **argv)
 {
-  struct addrinfo hints;
-  struct in6_addr addr;
+  struct addrinfo hints = { };
+  struct in6_addr addr = in6addr_any;
   int ret;
 
   ret = getaddrinfo(NULL, NULL, &hints, NULL);
   freeaddrinfo(NULL);
-  printf("%s\n", gai_strerror(ret));
-  addr = in6addr_any;
+  printf("%s %d\n", gai_strerror(ret), addr.s6_addr[0]);
+
   return 0;
 }
 EOF
@@ -2077,7 +2157,7 @@ if test "$libhdfs" = "yes" ; then
     hdfs_conf_error=1
   fi
   if test "$FIO_LIBHDFS_INCLUDE" = "" ; then
-    echo "configure: FIO_LIBHDFS_INCLUDE should be defined to libhdfs inlude path"
+    echo "configure: FIO_LIBHDFS_INCLUDE should be defined to libhdfs include path"
     hdfs_conf_error=1
   fi
   if test "$FIO_LIBHDFS_LIB" = "" ; then
@@ -2127,9 +2207,7 @@ cat > $TMPC << EOF
 #include <stdlib.h>
 int main(int argc, char **argv)
 {
-  int rc;
-  rc = pmem_is_pmem(NULL, 0);
-  return 0;
+  return pmem_is_pmem(NULL, 0);
 }
 EOF
 if compile_prog "" "-lpmem" "libpmem"; then
@@ -2148,7 +2226,7 @@ if test "$libpmem" = "yes"; then
 #include <stdlib.h>
 int main(int argc, char **argv)
 {
-  pmem_memcpy(NULL, NULL, NULL, NULL);
+  pmem_memcpy(NULL, NULL, 0, 0);
   return 0;
 }
 EOF
@@ -2157,6 +2235,26 @@ EOF
   fi
 fi
 print_config "libpmem1_5" "$libpmem1_5"
+
+##########################################
+# Check whether we have libpmem2
+if test "$libpmem2" != "yes" ; then
+  libpmem2="no"
+fi
+cat > $TMPC << EOF
+#include <libpmem2.h>
+int main(int argc, char **argv)
+{
+  struct pmem2_config *cfg;
+  pmem2_config_new(&cfg);
+  pmem2_config_delete(&cfg);
+  return 0;
+}
+EOF
+if compile_prog "" "-lpmem2" "libpmem2"; then
+  libpmem2="yes"
+fi
+print_config "libpmem2" "$libpmem2"
 
 ##########################################
 # Check whether we have libpmemblk
@@ -2280,6 +2378,22 @@ fi
 print_config "DAOS File System (dfs) Engine" "$dfs"
 
 ##########################################
+# Check if we have libnfs (for userspace nfs support).
+if test "$libnfs" != "no" ; then
+  if $(pkg-config libnfs > /dev/null 2>&1); then
+    libnfs="yes"
+    libnfs_cflags=$(pkg-config --cflags libnfs)
+    libnfs_libs=$(pkg-config --libs libnfs)
+  else
+    if test "$libnfs" = "yes" ; then
+      feature_not_found "libnfs" "libnfs"
+    fi
+    libnfs="no"
+  fi
+fi
+print_config "NFS engine" "$libnfs"
+
+##########################################
 # Check if we have lex/yacc available
 yacc="no"
 yacc_is_bison="no"
@@ -2349,7 +2463,7 @@ int main(int argc, char **argv)
   FILE *mtab = setmntent(NULL, "r");
   struct mntent *mnt = getmntent(mtab);
   endmntent(mtab);
-  return 0;
+  return mnt != NULL;
 }
 EOF
 if compile_prog "" "" "getmntent"; then
@@ -2482,7 +2596,7 @@ if compile_prog "" "" "valgrind_dev"; then
 fi
 print_config "Valgrind headers" "$valgrind_dev"
 
-if test "$targetos" = "Linux" ; then
+if test "$targetos" = "Linux" || test "$targetos" = "Android"; then
 ##########################################
 # <linux/blkzoned.h> probe
 if test "$linux_blkzoned" != "yes" ; then
@@ -2530,6 +2644,10 @@ int main(int argc, char **argv)
 }
 EOF
 if test "$libzbc" != "no" ; then
+  if [ -e /usr/include/libzbc/libzbc ]; then
+    # SUSE Linux.
+    CFLAGS="$CFLAGS -I/usr/include/libzbc"
+  fi
   if compile_prog "" "-lzbc" "libzbc"; then
     libzbc="yes"
     if ! check_min_lib_version libzbc 5; then
@@ -2544,22 +2662,72 @@ if test "$libzbc" != "no" ; then
 fi
 print_config "libzbc engine" "$libzbc"
 
+if test "$targetos" = "Linux" ; then
+##########################################
+# Check NVME_URING_CMD support
+cat > $TMPC << EOF
+#include <linux/nvme_ioctl.h>
+int main(void)
+{
+  return sizeof(struct nvme_uring_cmd);
+}
+EOF
+if compile_prog "" "" "nvme uring cmd"; then
+  output_sym "CONFIG_NVME_URING_CMD"
+  nvme_uring_cmd="yes"
+else
+  nvme_uring_cmd="no"
+fi
+print_config "NVMe uring command support" "$nvme_uring_cmd"
+fi
+
+##########################################
+# Check if we have xnvme
+if test "$xnvme" != "no" ; then
+  if check_min_lib_version xnvme 0.2.0; then
+    xnvme="yes"
+    xnvme_cflags=$(pkg-config --cflags xnvme)
+    xnvme_libs=$(pkg-config --libs xnvme)
+  else
+    xnvme="no"
+  fi
+fi
+print_config "xnvme engine" "$xnvme"
+
+##########################################
+# Check if we have libblkio
+if test "$libblkio" != "no" ; then
+  if check_min_lib_version blkio 1.0.0; then
+    libblkio="yes"
+    libblkio_cflags=$(pkg-config --cflags blkio)
+    libblkio_libs=$(pkg-config --libs blkio)
+  else
+    if test "$libblkio" = "yes" ; then
+      feature_not_found "libblkio" "libblkio-dev or libblkio-devel"
+    fi
+    libblkio="no"
+  fi
+fi
+print_config "libblkio engine" "$libblkio"
+
 ##########################################
 # check march=armv8-a+crc+crypto
-if test "$march_armv8_a_crc_crypto" != "yes" ; then
-  march_armv8_a_crc_crypto="no"
-fi
+march_armv8_a_crc_crypto="no"
 if test "$cpu" = "arm64" ; then
   cat > $TMPC <<EOF
+#if __linux__
 #include <arm_acle.h>
 #include <arm_neon.h>
 #include <sys/auxv.h>
+#endif
 
 int main(void)
 {
   /* Can we also do a runtime probe? */
 #if __linux__
   return getauxval(AT_HWCAP);
+#elif defined(__APPLE__)
+  return 0;
 #else
 # error "Don't know how to do runtime probe for ARM CRC32c"
 #endif
@@ -2606,9 +2774,9 @@ int main(int argc, char* argv[]) {
    return 0;
 }
 EOF
-  if compile_prog "" "-lcuda -lcudart -lcufile" "libcufile"; then
+  if compile_prog "" "-lcuda -lcudart -lcufile -ldl" "libcufile"; then
     libcufile="yes"
-    LIBS="-lcuda -lcudart -lcufile $LIBS"
+    LIBS="-lcuda -lcudart -lcufile -ldl $LIBS"
   else
     if test "$libcufile" = "yes" ; then
       feature_not_found "libcufile" ""
@@ -2686,6 +2854,22 @@ if compile_prog "-Wimplicit-fallthrough=2" "" "-Wimplicit-fallthrough=2"; then
   fallthrough="yes"
 fi
 print_config "-Wimplicit-fallthrough=2" "$fallthrough"
+
+##########################################
+# check if the compiler has -Wno-stringop-concatenation
+no_stringop="no"
+cat > $TMPC << EOF
+#include <stdio.h>
+
+int main(int argc, char **argv)
+{
+	return printf("%s\n", argv[0]);
+}
+EOF
+if compile_prog "-Wno-stringop-truncation -Werror" "" "no_stringop"; then
+  no_stringop="yes"
+fi
+print_config "-Wno-stringop-truncation" "$no_stringop"
 
 ##########################################
 # check for MADV_HUGEPAGE support
@@ -2849,6 +3033,9 @@ fi
 if test "$pthread_sigmask" = "yes" ; then
   output_sym "CONFIG_PTHREAD_SIGMASK"
 fi
+if test "$pthread_getaffinity" = "yes" ; then
+  output_sym "CONFIG_PTHREAD_GETAFFINITY"
+fi
 if test "$have_asprintf" = "yes" ; then
     output_sym "CONFIG_HAVE_ASPRINTF"
 fi
@@ -2890,11 +3077,13 @@ if test "$libverbs" = "yes" -a "$rdmacm" = "yes" ; then
 fi
 # librpma is supported on the 'x86_64' architecture for now
 if test "$cpu" = "x86_64" -a "$libverbs" = "yes" -a "$rdmacm" = "yes" \
-    -a "$librpma" = "yes" -a "$libpmem" = "yes" ; then
+    -a "$librpma" = "yes" \
+    && test "$libpmem" = "yes" -o "$libpmem2" = "yes" ; then
   output_sym "CONFIG_LIBRPMA_APM"
 fi
 if test "$cpu" = "x86_64" -a "$libverbs" = "yes" -a "$rdmacm" = "yes" \
-    -a "$librpma" = "yes" -a "$libpmem" = "yes" -a "$libprotobuf_c" = "yes" ; then
+    -a "$librpma" = "yes" -a "$libprotobuf_c" = "yes" \
+    && test "$libpmem" = "yes" -o "$libpmem2" = "yes" ; then
   output_sym "CONFIG_LIBRPMA_GPSPM"
 fi
 if test "$clock_gettime" = "yes" ; then
@@ -3041,6 +3230,9 @@ fi
 if test "$pmem" = "yes" ; then
   output_sym "CONFIG_LIBPMEM"
 fi
+if test "$libpmem2" = "yes" ; then
+  output_sym "CONFIG_LIBPMEM2_INSTALLED"
+fi
 if test "$libime" = "yes" ; then
   output_sym "CONFIG_IME"
 fi
@@ -3086,7 +3278,7 @@ if test "$libzbc" = "yes" ; then
   output_sym "CONFIG_LIBZBC"
 fi
 if test "$zlib" = "no" ; then
-  echo "Consider installing zlib-dev (zlib-devel, some fio features depend on it."
+  echo "Consider installing zlib1g-dev (zlib-devel) as some fio features depend on it."
   if test "$build_static" = "yes"; then
     echo "Note that some distros have separate packages for static libraries."
   fi
@@ -3127,6 +3319,9 @@ fi
 if test "$fallthrough" = "yes"; then
   CFLAGS="$CFLAGS -Wimplicit-fallthrough"
 fi
+if test "$no_stringop" = "yes"; then
+  output_sym "CONFIG_HAVE_NO_STRINGOP"
+fi
 if test "$thp" = "yes" ; then
   output_sym "CONFIG_HAVE_THP"
 fi
@@ -3142,13 +3337,34 @@ if test "$libnbd" = "yes" ; then
   echo "LIBNBD_CFLAGS=$libnbd_cflags" >> $config_host_mak
   echo "LIBNBD_LIBS=$libnbd_libs" >> $config_host_mak
 fi
+if test "$libnfs" = "yes" ; then
+  output_sym "CONFIG_LIBNFS"
+  echo "LIBNFS_CFLAGS=$libnfs_cflags" >> $config_host_mak
+  echo "LIBNFS_LIBS=$libnfs_libs" >> $config_host_mak
+fi
+if test "$xnvme" = "yes" ; then
+  output_sym "CONFIG_LIBXNVME"
+  echo "LIBXNVME_CFLAGS=$xnvme_cflags" >> $config_host_mak
+  echo "LIBXNVME_LIBS=$xnvme_libs" >> $config_host_mak
+fi
+if test "$libblkio" = "yes" ; then
+  output_sym "CONFIG_LIBBLKIO"
+  echo "LIBBLKIO_CFLAGS=$libblkio_cflags" >> $config_host_mak
+  echo "LIBBLKIO_LIBS=$libblkio_libs" >> $config_host_mak
+fi
 if test "$dynamic_engines" = "yes" ; then
   output_sym "CONFIG_DYNAMIC_ENGINES"
 fi
 if test "$pdb" = yes; then
   output_sym "CONFIG_PDB"
 fi
-
+if test "$fcntl_sync" = "yes" ; then
+  output_sym "CONFIG_FCNTL_SYNC"
+fi
+if test "$asan" = "yes"; then
+  CFLAGS="$CFLAGS -fsanitize=address"
+  LDFLAGS="$LDFLAGS -fsanitize=address"
+fi
 print_config "Lib-based ioengines dynamic" "$dynamic_engines"
 cat > $TMPC << EOF
 int main(int argc, char **argv)
@@ -3168,6 +3384,15 @@ if test "$disable_tcmalloc" != "yes"; then
   fi
 fi
 print_config "TCMalloc support" "$tcmalloc"
+if ! num "$seed_buckets"; then
+  seed_buckets=4
+elif test "$seed_buckets" -lt 2; then
+  seed_buckets=2
+elif test "$seed_buckets" -gt 16; then
+  seed_buckets=16
+fi
+echo "#define CONFIG_SEED_BUCKETS $seed_buckets" >> $config_host_h
+print_config "seed_buckets" "$seed_buckets"
 
 echo "LIBS+=$LIBS" >> $config_host_mak
 echo "GFIO_LIBS+=$GFIO_LIBS" >> $config_host_mak

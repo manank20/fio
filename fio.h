@@ -47,6 +47,7 @@
 #include "workqueue.h"
 #include "steadystate.h"
 #include "lib/nowarn_snprintf.h"
+#include "dedupe.h"
 
 #ifdef CONFIG_SOLARISAIO
 #include <sys/asynch.h>
@@ -96,6 +97,7 @@ enum {
 	__TD_F_MMAP_KEEP,
 	__TD_F_DIRS_CREATED,
 	__TD_F_CHECK_RATE,
+	__TD_F_SYNCS,
 	__TD_F_LAST,		/* not a real bit, keep last */
 };
 
@@ -117,6 +119,7 @@ enum {
 	TD_F_MMAP_KEEP		= 1U << __TD_F_MMAP_KEEP,
 	TD_F_DIRS_CREATED	= 1U << __TD_F_DIRS_CREATED,
 	TD_F_CHECK_RATE		= 1U << __TD_F_CHECK_RATE,
+	TD_F_SYNCS		= 1U << __TD_F_SYNCS,
 };
 
 enum {
@@ -140,6 +143,7 @@ enum {
 	FIO_RAND_POISSON2_OFF,
 	FIO_RAND_POISSON3_OFF,
 	FIO_RAND_PRIO_CMDS,
+	FIO_RAND_DEDUPE_WORKING_SET_IX,
 	FIO_RAND_NR_OFFS,
 };
 
@@ -180,7 +184,7 @@ struct zone_split_index {
  */
 struct thread_data {
 	struct flist_head opt_list;
-	unsigned long flags;
+	unsigned long long flags;
 	struct thread_options o;
 	void *eo;
 	pthread_t thread;
@@ -259,9 +263,14 @@ struct thread_data {
 
 	struct frand_state buf_state;
 	struct frand_state buf_state_prev;
+	struct frand_state buf_state_ret;
 	struct frand_state dedupe_state;
 	struct frand_state zone_state;
 	struct frand_state prio_state;
+	struct frand_state dedupe_working_set_index_state;
+	struct frand_state *dedupe_working_set_states;
+
+	unsigned long long num_unique_pages;
 
 	struct zone_split_index **zone_state_index;
 	unsigned int num_open_zones;
@@ -272,6 +281,11 @@ struct thread_data {
 	struct thread_io_list *vstate;
 
 	int shm_id;
+
+	/*
+	 * Job default IO priority set with prioclass and prio options.
+	 */
+	unsigned int ioprio;
 
 	/*
 	 * IO engine hooks, contains everything needed to submit an io_u
@@ -323,10 +337,10 @@ struct thread_data {
 	 */
 	uint64_t rate_bps[DDIR_RWDIR_CNT];
 	uint64_t rate_next_io_time[DDIR_RWDIR_CNT];
-	unsigned long long rate_bytes[DDIR_RWDIR_CNT];
-	unsigned long rate_blocks[DDIR_RWDIR_CNT];
+	unsigned long long last_rate_check_bytes[DDIR_RWDIR_CNT];
+	unsigned long last_rate_check_blocks[DDIR_RWDIR_CNT];
 	unsigned long long rate_io_issue_bytes[DDIR_RWDIR_CNT];
-	struct timespec lastrate[DDIR_RWDIR_CNT];
+	struct timespec last_rate_check_time[DDIR_RWDIR_CNT];
 	int64_t last_usec[DDIR_RWDIR_CNT];
 	struct frand_state poisson_state[DDIR_RWDIR_CNT];
 
@@ -342,6 +356,7 @@ struct thread_data {
 	 * Issue side
 	 */
 	uint64_t io_issues[DDIR_RWDIR_CNT];
+	uint64_t verify_read_issues;
 	uint64_t io_issue_bytes[DDIR_RWDIR_CNT];
 	uint64_t loops;
 
@@ -356,8 +371,11 @@ struct thread_data {
 	uint64_t zone_bytes;
 	struct fio_sem *sem;
 	uint64_t bytes_done[DDIR_RWDIR_CNT];
+	uint64_t bytes_verified;
 
 	uint64_t *thinktime_blocks_counter;
+	struct timespec last_thinktime;
+	uint64_t last_thinktime_blocks;
 
 	/*
 	 * State for random io, a bitmap of blocks done vs not done
@@ -366,7 +384,7 @@ struct thread_data {
 
 	struct timespec start;	/* start of this loop */
 	struct timespec epoch;	/* time job was started */
-	unsigned long long unix_epoch; /* Time job was started, unix epoch based. */
+	unsigned long long alternate_epoch; /* Time job was started, clock_gettime's clock_id epoch based. */
 	struct timespec last_issue;
 	long time_offset;
 	struct timespec ts_cache;
@@ -413,9 +431,14 @@ struct thread_data {
 	 */
 	struct flist_head io_log_list;
 	FILE *io_log_rfile;
+	unsigned int io_log_blktrace;
+	unsigned int io_log_blktrace_swap;
+	unsigned long long io_log_last_ttime;
+	struct timespec io_log_start_time;
 	unsigned int io_log_current;
 	unsigned int io_log_checkmark;
 	unsigned int io_log_highmark;
+	unsigned int io_log_version;
 	struct timespec io_log_highmark_time;
 
 	/*
@@ -661,13 +684,13 @@ enum {
 	TD_NR,
 };
 
-#define TD_ENG_FLAG_SHIFT	17
-#define TD_ENG_FLAG_MASK	((1U << 17) - 1)
+#define TD_ENG_FLAG_SHIFT	18
+#define TD_ENG_FLAG_MASK	((1ULL << 18) - 1)
 
 static inline void td_set_ioengine_flags(struct thread_data *td)
 {
 	td->flags = (~(TD_ENG_FLAG_MASK << TD_ENG_FLAG_SHIFT) & td->flags) |
-		    (td->io_ops->flags << TD_ENG_FLAG_SHIFT);
+		    ((unsigned long long)td->io_ops->flags << TD_ENG_FLAG_SHIFT);
 }
 
 static inline bool td_ioengine_flagged(struct thread_data *td,

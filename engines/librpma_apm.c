@@ -22,8 +22,7 @@ static inline int client_io_flush(struct thread_data *td,
 		struct io_u *first_io_u, struct io_u *last_io_u,
 		unsigned long long int len);
 
-static int client_get_io_u_index(struct rpma_completion *cmpl,
-		unsigned int *io_u_index);
+static int client_get_io_u_index(struct ibv_wc *wc, unsigned int *io_u_index);
 
 static int client_init(struct thread_data *td)
 {
@@ -188,10 +187,9 @@ static inline int client_io_flush(struct thread_data *td,
 	return 0;
 }
 
-static int client_get_io_u_index(struct rpma_completion *cmpl,
-		unsigned int *io_u_index)
+static int client_get_io_u_index(struct ibv_wc *wc, unsigned int *io_u_index)
 {
-	memcpy(io_u_index, &cmpl->op_context, sizeof(*io_u_index));
+	memcpy(io_u_index, &wc->wr_id, sizeof(*io_u_index));
 
 	return 1;
 }
@@ -210,7 +208,7 @@ FIO_STATIC struct ioengine_ops ioengine_client = {
 	.errdetails		= librpma_fio_client_errdetails,
 	.close_file		= librpma_fio_file_nop,
 	.cleanup		= client_cleanup,
-	.flags			= FIO_DISKLESSIO,
+	.flags			= FIO_DISKLESSIO | FIO_ASYNCIO_SETS_ISSUE_TIME,
 	.options		= librpma_fio_options,
 	.option_struct_size	= sizeof(struct librpma_fio_options_values),
 };

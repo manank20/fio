@@ -224,6 +224,13 @@ static struct option l_opts[FIO_NR_OPTIONS] = {
 		.has_arg	= optional_argument,
 		.val		= 'S',
 	},
+#ifdef WIN32
+	{
+		.name		= (char *) "server-internal",
+		.has_arg	= required_argument,
+		.val		= 'N',
+	},
+#endif
 	{	.name		= (char *) "daemonize",
 		.has_arg	= required_argument,
 		.val		= 'D',
@@ -633,6 +640,11 @@ static int fixup_options(struct thread_data *td)
 		ret |= 1;
 	}
 
+	if (o->zone_mode == ZONE_MODE_ZBD && !o->create_serialize) {
+		log_err("fio: --zonemode=zbd and --create_serialize=0 are not compatible.\n");
+		ret |= 1;
+	}
+
 	if (o->zone_mode == ZONE_MODE_STRIDED && !o->zone_size) {
 		log_err("fio: --zonesize must be specified when using --zonemode=strided.\n");
 		ret |= 1;
@@ -953,6 +965,28 @@ static int fixup_options(struct thread_data *td)
 
 	o->latency_target *= 1000ULL;
 
+	/*
+	 * Dedupe working set verifications
+	 */
+	if (o->dedupe_percentage && o->dedupe_mode == DEDUPE_MODE_WORKING_SET) {
+		if (!fio_option_is_set(o, size)) {
+			log_err("fio: pregenerated dedupe working set "
+					"requires size to be set\n");
+			ret |= 1;
+		} else if (o->nr_files != 1) {
+			log_err("fio: dedupe working set mode supported with "
+					"single file per job, but %d files "
+					"provided\n", o->nr_files);
+			ret |= 1;
+		} else if (o->dedupe_working_set_percentage + o->dedupe_percentage > 100) {
+			log_err("fio: impossible to reach expected dedupe percentage %u "
+					"since %u percentage of size is reserved to dedupe working set "
+					"(those are unique pages)\n",
+					o->dedupe_percentage, o->dedupe_working_set_percentage);
+			ret |= 1;
+		}
+	}
+
 	return ret;
 }
 
@@ -1026,6 +1060,7 @@ static void td_fill_rand_seeds_internal(struct thread_data *td, bool use64)
 	init_rand_seed(&td->dedupe_state, td->rand_seeds[FIO_DEDUPE_OFF], false);
 	init_rand_seed(&td->zone_state, td->rand_seeds[FIO_RAND_ZONE_OFF], false);
 	init_rand_seed(&td->prio_state, td->rand_seeds[FIO_RAND_PRIO_CMDS], false);
+	init_rand_seed(&td->dedupe_working_set_index_state, td->rand_seeds[FIO_RAND_DEDUPE_WORKING_SET_IX], use64);
 
 	if (!td_random(td))
 		return;
@@ -1417,6 +1452,26 @@ static bool wait_for_ok(const char *jobname, struct thread_options *o)
 	return true;
 }
 
+static int verify_per_group_options(struct thread_data *td, const char *jobname)
+{
+	struct thread_data *td2;
+	int i;
+
+	for_each_td(td2, i) {
+		if (td->groupid != td2->groupid)
+			continue;
+
+		if (td->o.stats &&
+		    td->o.lat_percentiles != td2->o.lat_percentiles) {
+			log_err("fio: lat_percentiles in job: %s differs from group\n",
+				jobname);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 /*
  * Treat an empty log file name the same as a one not given
  */
@@ -1486,6 +1541,9 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 	if (fixup_options(td))
 		goto err;
 
+	if (!td->o.dedupe_global && init_dedupe_working_set_seeds(td, 0))
+		goto err;
+
 	/*
 	 * Belongs to fixup_options, but o->name is not necessarily set as yet
 	 */
@@ -1517,17 +1575,15 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 	memcpy(td->ts.percentile_list, o->percentile_list, sizeof(o->percentile_list));
 	td->ts.sig_figs = o->sig_figs;
 
-	for (i = 0; i < DDIR_RWDIR_CNT; i++) {
-		td->ts.clat_stat[i].min_val = ULONG_MAX;
-		td->ts.slat_stat[i].min_val = ULONG_MAX;
-		td->ts.lat_stat[i].min_val = ULONG_MAX;
-		td->ts.bw_stat[i].min_val = ULONG_MAX;
-		td->ts.iops_stat[i].min_val = ULONG_MAX;
-		td->ts.clat_high_prio_stat[i].min_val = ULONG_MAX;
-		td->ts.clat_low_prio_stat[i].min_val = ULONG_MAX;
-	}
-	td->ts.sync_stat.min_val = ULONG_MAX;
-	td->ddir_seq_nr = o->ddir_seq_nr;
+	init_thread_stat_min_vals(&td->ts);
+
+	/*
+	 * td->>ddir_seq_nr needs to be initialized to 1, NOT o->ddir_seq_nr,
+	 * so that get_next_offset gets a new random offset the first time it
+	 * is called, instead of keeping an initial offset of 0 for the first
+	 * nr-1 calls
+	 */
+	td->ddir_seq_nr = 1;
 
 	if ((o->stonewall || o->new_group) && prev_group_jobs) {
 		prev_group_jobs = 0;
@@ -1541,6 +1597,10 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 	td->groupid = groupid;
 	prev_group_jobs++;
 
+	if (td->o.group_reporting && prev_group_jobs > 1 &&
+	    verify_per_group_options(td, jobname))
+		goto err;
+
 	if (setup_rate(td))
 		goto err;
 
@@ -1552,6 +1612,7 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			.hist_coarseness = o->log_hist_coarseness,
 			.log_type = IO_LOG_TYPE_LAT,
 			.log_offset = o->log_offset,
+			.log_prio = o->log_prio,
 			.log_gz = o->log_gz,
 			.log_gz_store = o->log_gz_store,
 		};
@@ -1563,17 +1624,23 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 		else
 			suf = "log";
 
-		gen_log_name(logname, sizeof(logname), "lat", pre,
-				td->thread_number, suf, o->per_job_logs);
-		setup_log(&td->lat_log, &p, logname);
+		if (!o->disable_lat) {
+			gen_log_name(logname, sizeof(logname), "lat", pre,
+				     td->thread_number, suf, o->per_job_logs);
+			setup_log(&td->lat_log, &p, logname);
+		}
 
-		gen_log_name(logname, sizeof(logname), "slat", pre,
-				td->thread_number, suf, o->per_job_logs);
-		setup_log(&td->slat_log, &p, logname);
+		if (!o->disable_slat) {
+			gen_log_name(logname, sizeof(logname), "slat", pre,
+				     td->thread_number, suf, o->per_job_logs);
+			setup_log(&td->slat_log, &p, logname);
+		}
 
-		gen_log_name(logname, sizeof(logname), "clat", pre,
-				td->thread_number, suf, o->per_job_logs);
-		setup_log(&td->clat_log, &p, logname);
+		if (!o->disable_clat) {
+			gen_log_name(logname, sizeof(logname), "clat", pre,
+				     td->thread_number, suf, o->per_job_logs);
+			setup_log(&td->clat_log, &p, logname);
+		}
 
 	}
 
@@ -1585,6 +1652,7 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			.hist_coarseness = o->log_hist_coarseness,
 			.log_type = IO_LOG_TYPE_HIST,
 			.log_offset = o->log_offset,
+			.log_prio = o->log_prio,
 			.log_gz = o->log_gz,
 			.log_gz_store = o->log_gz_store,
 		};
@@ -1616,6 +1684,7 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			.hist_coarseness = o->log_hist_coarseness,
 			.log_type = IO_LOG_TYPE_BW,
 			.log_offset = o->log_offset,
+			.log_prio = o->log_prio,
 			.log_gz = o->log_gz,
 			.log_gz_store = o->log_gz_store,
 		};
@@ -1647,6 +1716,7 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			.hist_coarseness = o->log_hist_coarseness,
 			.log_type = IO_LOG_TYPE_IOPS,
 			.log_offset = o->log_offset,
+			.log_prio = o->log_prio,
 			.log_gz = o->log_gz,
 			.log_gz_store = o->log_gz_store,
 		};
@@ -2115,6 +2185,10 @@ static int __parse_jobs_ini(struct thread_data *td,
 		i++;
 	}
 
+	free(job_sections);
+	job_sections = NULL;
+	nr_job_sections = 0;
+
 	free(opts);
 out:
 	free(string);
@@ -2195,7 +2269,7 @@ static void usage(const char *name)
 	printf("  --minimal\t\tMinimal (terse) output\n");
 	printf("  --output-format=type\tOutput format (terse,json,json+,normal)\n");
 	printf("  --terse-version=type\tSet terse version output format"
-		" (default 3, or 2 or 4)\n");
+		" (default 3, or 2 or 4 or 5)\n");
 	printf("  --version\t\tPrint version info and exit\n");
 	printf("  --help\t\tPrint this page\n");
 	printf("  --cpuclock-test\tPerform test/validation of CPU clock\n");
@@ -2736,6 +2810,15 @@ int parse_cmd_line(int argc, char *argv[], int client_type)
 				break;
 
 			ret = fio_cmd_ioengine_option_parse(td, opt, val);
+
+			if (ret) {
+				if (td) {
+					put_job(td);
+					td = NULL;
+				}
+				do_exit++;
+				exit_val = 1;
+			}
 			break;
 		}
 		case 'w':
@@ -2763,6 +2846,12 @@ int parse_cmd_line(int argc, char *argv[], int client_type)
 			exit_val = 1;
 #endif
 			break;
+#ifdef WIN32
+		case 'N':
+			did_arg = true;
+			fio_server_internal_set(optarg);
+			break;
+#endif
 		case 'D':
 			if (pid_file)
 				free(pid_file);
@@ -2910,7 +2999,7 @@ int parse_cmd_line(int argc, char *argv[], int client_type)
 			log_err("%s: unrecognized option '%s'\n", argv[0],
 							argv[optind - 1]);
 			show_closest_option(argv[optind - 1]);
-			fallthrough;
+			fio_fallthrough;
 		default:
 			do_exit++;
 			exit_val = 1;

@@ -9,32 +9,6 @@
    (C) 2002 William Lee Irwin III, IBM */
 
 /*
- * Knuth recommends primes in approximately golden ratio to the maximum
- * integer representable by a machine word for multiplicative hashing.
- * Chuck Lever verified the effectiveness of this technique:
- * http://www.citi.umich.edu/techreports/reports/citi-tr-00-1.pdf
- *
- * These primes are chosen to be bit-sparse, that is operations on
- * them can use shifts and additions instead of multiplications for
- * machines where multiplications are slow.
- */
-
-#if BITS_PER_LONG == 32
-/* 2^31 + 2^29 - 2^25 + 2^22 - 2^19 - 2^16 + 1 */
-#define GOLDEN_RATIO_PRIME 0x9e370001UL
-#elif BITS_PER_LONG == 64
-/*  2^63 + 2^61 - 2^57 + 2^54 - 2^51 - 2^18 + 1 */
-#define GOLDEN_RATIO_PRIME 0x9e37fffffffc0001UL
-#else
-#error Define GOLDEN_RATIO_PRIME for your wordsize.
-#endif
-
-/*
- * The above primes are actively bad for hashing, since they are
- * too sparse. The 32-bit one is mostly ok, the 64-bit one causes
- * real problems. Besides, the "prime" part is pointless for the
- * multiplicative hash.
- *
  * Although a random odd number will do, it turns out that the golden
  * ratio phi = (sqrt(5)-1)/2, or its negative, has particularly nice
  * properties.
@@ -142,20 +116,20 @@ static inline uint32_t jhash(const void *key, uint32_t length, uint32_t initval)
 	/* Last block: affect all 32 bits of (c) */
 	/* All the case statements fall through */
 	switch (length) {
-	case 12: c += (uint32_t) k[11] << 24;	fallthrough;
-	case 11: c += (uint32_t) k[10] << 16;	fallthrough;
-	case 10: c += (uint32_t) k[9] << 8;	fallthrough;
-	case 9:  c += k[8];			fallthrough;
-	case 8:  b += (uint32_t) k[7] << 24;	fallthrough;
-	case 7:  b += (uint32_t) k[6] << 16;	fallthrough;
-	case 6:  b += (uint32_t) k[5] << 8;	fallthrough;
-	case 5:  b += k[4];			fallthrough;
-	case 4:  a += (uint32_t) k[3] << 24;	fallthrough;
-	case 3:  a += (uint32_t) k[2] << 16;	fallthrough;
-	case 2:  a += (uint32_t) k[1] << 8;	fallthrough;
+	case 12: c += (uint32_t) k[11] << 24;	fio_fallthrough;
+	case 11: c += (uint32_t) k[10] << 16;	fio_fallthrough;
+	case 10: c += (uint32_t) k[9] << 8;	fio_fallthrough;
+	case 9:  c += k[8];			fio_fallthrough;
+	case 8:  b += (uint32_t) k[7] << 24;	fio_fallthrough;
+	case 7:  b += (uint32_t) k[6] << 16;	fio_fallthrough;
+	case 6:  b += (uint32_t) k[5] << 8;	fio_fallthrough;
+	case 5:  b += k[4];			fio_fallthrough;
+	case 4:  a += (uint32_t) k[3] << 24;	fio_fallthrough;
+	case 3:  a += (uint32_t) k[2] << 16;	fio_fallthrough;
+	case 2:  a += (uint32_t) k[1] << 8;	fio_fallthrough;
 	case 1:  a += k[0];
 		 __jhash_final(a, b, c);
-		 fallthrough;
+		 fio_fallthrough;
 	case 0: /* Nothing left to add */
 		break;
 	}

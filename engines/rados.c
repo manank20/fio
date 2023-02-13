@@ -37,7 +37,9 @@ struct rados_options {
 	char *cluster_name;
 	char *pool_name;
 	char *client_name;
+	char *conf;
 	int busy_poll;
+	int touch_objects;
 };
 
 static struct fio_option options[] = {
@@ -69,12 +71,32 @@ static struct fio_option options[] = {
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
+		.name     = "conf",
+		.lname    = "ceph configuration file path",
+		.type     = FIO_OPT_STR_STORE,
+		.help     = "Path of the ceph configuration file",
+		.off1     = offsetof(struct rados_options, conf),
+		.def      = "/etc/ceph/ceph.conf",
+		.category = FIO_OPT_C_ENGINE,
+		.group    = FIO_OPT_G_RBD,
+	},
+	{
 		.name     = "busy_poll",
 		.lname    = "busy poll mode",
 		.type     = FIO_OPT_BOOL,
 		.help     = "Busy poll for completions instead of sleeping",
 		.off1     = offsetof(struct rados_options, busy_poll),
 		.def	  = "0",
+		.category = FIO_OPT_C_ENGINE,
+		.group    = FIO_OPT_G_RBD,
+	},
+	{
+		.name     = "touch_objects",
+		.lname    = "touch objects on start",
+		.type     = FIO_OPT_BOOL,
+		.help     = "Touch (create) objects on start",
+		.off1     = offsetof(struct rados_options, touch_objects),
+		.def	  = "1",
 		.category = FIO_OPT_C_ENGINE,
 		.group    = FIO_OPT_G_RBD,
 	},
@@ -140,7 +162,7 @@ static int _fio_rados_connect(struct thread_data *td)
 		char *client_name = NULL;
 
 		/*
-		* If we specify cluser name, the rados_create2
+		* If we specify cluster name, the rados_create2
 		* will not assume 'client.'. name is considered
 		* as a full type.id namestr
 		*/
@@ -173,7 +195,7 @@ static int _fio_rados_connect(struct thread_data *td)
 		goto failed_early;
 	}
 
-	r = rados_conf_read_file(rados->cluster, NULL);
+	r = rados_conf_read_file(rados->cluster, o->conf);
 	if (r < 0) {
 		log_err("rados_conf_read_file failed.\n");
 		goto failed_early;
@@ -194,9 +216,11 @@ static int _fio_rados_connect(struct thread_data *td)
 	for (i = 0; i < td->o.nr_files; i++) {
 		f = td->files[i];
 		f->real_file_size = file_size;
-		r = rados_write(rados->io_ctx, f->file_name, "", 0, 0);
-		if (r < 0) {
-			goto failed_obj_create;
+		if (o->touch_objects) {
+			r = rados_write(rados->io_ctx, f->file_name, "", 0, 0);
+			if (r < 0) {
+				goto failed_obj_create;
+			}
 		}
 	}
 	return 0;

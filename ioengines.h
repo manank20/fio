@@ -8,7 +8,7 @@
 #include "io_u.h"
 #include "zbd_types.h"
 
-#define FIO_IOOPS_VERSION	29
+#define FIO_IOOPS_VERSION	31
 
 #ifndef CONFIG_DYNAMIC_ENGINES
 #define FIO_STATIC	static
@@ -59,6 +59,10 @@ struct ioengine_ops {
 			    uint64_t, struct zbd_zone *, unsigned int);
 	int (*reset_wp)(struct thread_data *, struct fio_file *,
 			uint64_t, uint64_t);
+	int (*get_max_open_zones)(struct thread_data *, struct fio_file *,
+				  unsigned int *);
+	int (*finish_zone)(struct thread_data *, struct fio_file *,
+			   uint64_t, uint64_t);
 	int option_struct_size;
 	struct fio_option *options;
 };
@@ -81,6 +85,13 @@ enum fio_ioengine_flags {
 	FIO_ASYNCIO_SYNC_TRIM
 			= 1 << 14,	/* io engine has async ->queue except for trim */
 	FIO_NO_OFFLOAD	= 1 << 15,	/* no async offload */
+	FIO_ASYNCIO_SETS_ISSUE_TIME
+			= 1 << 16,	/* async ioengine with commit function that sets issue_time */
+	FIO_SKIPPABLE_IOMEM_ALLOC
+			= 1 << 17,	/* skip iomem_alloc & iomem_free if job sets mem/iomem */
+	FIO_RO_NEEDS_RW_OPEN
+			= 1 << 18,	/* open files in rw mode even if we have a read job; only
+					   affects ioengines using generic_open_file */
 };
 
 /*

@@ -64,6 +64,34 @@ check_blkzone() {
 	fi
 }
 
+# Check zone capacity of each zone and report block size aligned to the zone
+# capacities. If zone capacity is same as zone size for zones, report zone size.
+zone_cap_bs() {
+	local dev="${1}"
+	local zone_size="${2}"
+	local sed_str='s/.*len \([0-9A-Za-z]*\), cap \([0-9A-Za-z]*\).*/\1 \2/p'
+	local cap bs="$zone_size"
+
+	# When blkzone command is neither available nor relevant to the
+	# test device, or when blkzone command does not report capacity,
+	# assume that zone capacity is same as zone size for all zones.
+	if [ -z "${blkzone}" ] || [ -z "$is_zbd" ] || [ -c "$dev" ] ||
+		   ! blkzone_reports_capacity "${dev}"; then
+		echo "$zone_size"
+		return
+	fi
+
+	while read -r -a line; do
+		((line[0] == line[1])) && continue
+		cap=$((line[1] * 512))
+		while ((bs > 512 && cap % bs)); do
+			bs=$((bs / 2))
+		done
+	done < <(blkzone report "${dev}" | sed -n "${sed_str}")
+
+	echo "$bs"
+}
+
 # Reports the starting sector and length of the first sequential zone of device
 # $1.
 first_sequential_zone() {
@@ -173,15 +201,23 @@ last_online_zone() {
     fi
 }
 
+# Get max_open_zones of SMR drives using sg_inq or libzbc tools. Two test cases
+# 31 and 32 use this max_open_zones value. The test case 31 uses max_open_zones
+# to decide number of write target zones. The test case 32 passes max_open_zones
+# value to fio with --max_open_zones option. Of note is that fio itself has the
+# feature to get max_open_zones from the device through sysfs or ioengine
+# specific implementation. This max_open_zones fetch by test script is required
+# in case fio is running on an old Linux kernel version which lacks
+# max_open_zones in sysfs, or which lacks zoned block device support completely.
 max_open_zones() {
     local dev=$1
 
     if [ -n "${sg_inq}" ] && [ ! -n "${use_libzbc}" ]; then
 	if ! ${sg_inq} -e --page=0xB6 --len=20 --hex "$dev" \
 		 > /dev/null 2>&1; then
-	    # Non scsi device such as null_blk can not return max open zones.
-	    # Use default value.
-	    echo 128
+	    # When sg_inq can not get max open zones, specify 0 which indicates
+	    # fio to get max open zones limit from the device.
+	    echo 0
 	else
 	    ${sg_inq} -e --page=0xB6 --len=20 --hex "$dev" | tail -1 |
 		{
@@ -194,9 +230,11 @@ max_open_zones() {
 		    echo ${max_nr_open_zones}
 		}
 	fi
-    else
+    elif [ -n "${use_libzbc}" ]; then
 	${zbc_report_zones} "$dev" |
 	    sed -n 's/^[[:blank:]]*Maximum number of open sequential write required zones:[[:blank:]]*//p'
+    else
+	echo 0
     fi
 }
 

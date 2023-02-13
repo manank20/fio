@@ -31,6 +31,7 @@
 static int iolog_flush(struct io_log *log);
 
 static const char iolog_ver2[] = "fio version 2 iolog";
+static const char iolog_ver3[] = "fio version 3 iolog";
 
 void queue_io_piece(struct thread_data *td, struct io_piece *ipo)
 {
@@ -40,18 +41,24 @@ void queue_io_piece(struct thread_data *td, struct io_piece *ipo)
 
 void log_io_u(const struct thread_data *td, const struct io_u *io_u)
 {
+	struct timespec now;
+
 	if (!td->o.write_iolog_file)
 		return;
 
-	fprintf(td->iolog_f, "%s %s %llu %llu\n", io_u->file->file_name,
-						io_ddir_name(io_u->ddir),
-						io_u->offset, io_u->buflen);
+	fio_gettime(&now, NULL);
+	fprintf(td->iolog_f, "%llu %s %s %llu %llu\n",
+		(unsigned long long) utime_since_now(&td->io_log_start_time),
+		io_u->file->file_name, io_ddir_name(io_u->ddir), io_u->offset,
+		io_u->buflen);
+
 }
 
 void log_file(struct thread_data *td, struct fio_file *f,
 	      enum file_log_act what)
 {
 	const char *act[] = { "add", "open", "close" };
+	struct timespec now;
 
 	assert(what < 3);
 
@@ -65,7 +72,10 @@ void log_file(struct thread_data *td, struct fio_file *f,
 	if (!td->iolog_f)
 		return;
 
-	fprintf(td->iolog_f, "%s %s\n", f->file_name, act[what]);
+	fio_gettime(&now, NULL);
+	fprintf(td->iolog_f, "%llu %s %s\n",
+		(unsigned long long) utime_since_now(&td->io_log_start_time),
+		f->file_name, act[what]);
 }
 
 static void iolog_delay(struct thread_data *td, unsigned long delay)
@@ -116,6 +126,10 @@ static int ipo_special(struct thread_data *td, struct io_piece *ipo)
 
 	f = td->files[ipo->fileno];
 
+	if (ipo->delay)
+		iolog_delay(td, ipo->delay);
+	if (fio_fill_issue_time(td))
+		fio_gettime(&td->last_issue, NULL);
 	switch (ipo->file_action) {
 	case FIO_LOG_OPEN_FILE:
 		if (td->o.replay_redirect && fio_file_open(f)) {
@@ -134,6 +148,11 @@ static int ipo_special(struct thread_data *td, struct io_piece *ipo)
 	case FIO_LOG_UNLINK_FILE:
 		td_io_unlink_file(td, f);
 		break;
+	case FIO_LOG_ADD_FILE:
+		/*
+		 * Nothing to do
+		 */
+		break;
 	default:
 		log_err("fio: bad file action %d\n", ipo->file_action);
 		break;
@@ -142,7 +161,25 @@ static int ipo_special(struct thread_data *td, struct io_piece *ipo)
 	return 1;
 }
 
-static bool read_iolog2(struct thread_data *td);
+static bool read_iolog(struct thread_data *td);
+
+unsigned long long delay_since_ttime(const struct thread_data *td,
+	       unsigned long long time)
+{
+	double tmp;
+	double scale;
+	const unsigned long long *last_ttime = &td->io_log_last_ttime;
+
+	if (!*last_ttime || td->o.no_stall || time < *last_ttime)
+		return 0;
+	else if (td->o.replay_time_scale == 100)
+		return time - *last_ttime;
+
+
+	scale = (double) 100.0 / (double) td->o.replay_time_scale;
+	tmp = time - *last_ttime;
+	return tmp * scale;
+}
 
 int read_iolog_get(struct thread_data *td, struct io_u *io_u)
 {
@@ -151,10 +188,16 @@ int read_iolog_get(struct thread_data *td, struct io_u *io_u)
 
 	while (!flist_empty(&td->io_log_list)) {
 		int ret;
+
 		if (td->o.read_iolog_chunked) {
 			if (td->io_log_checkmark == td->io_log_current) {
-				if (!read_iolog2(td))
-					return 1;
+				if (td->io_log_blktrace) {
+					if (!read_blktrace(td))
+						return 1;
+				} else {
+					if (!read_iolog(td))
+						return 1;
+				}
 			}
 			td->io_log_current--;
 		}
@@ -354,7 +397,7 @@ void write_iolog_close(struct thread_data *td)
 	td->iolog_buf = NULL;
 }
 
-static int64_t iolog_items_to_fetch(struct thread_data *td)
+int64_t iolog_items_to_fetch(struct thread_data *td)
 {
 	struct timespec now;
 	uint64_t elapsed;
@@ -382,20 +425,27 @@ static int64_t iolog_items_to_fetch(struct thread_data *td)
 	return items_to_fetch;
 }
 
+#define io_act(_td, _r) (((_td)->io_log_version == 3 && (r) == 5) || \
+					((_td)->io_log_version == 2 && (r) == 4))
+#define file_act(_td, _r) (((_td)->io_log_version == 3 && (r) == 3) || \
+					((_td)->io_log_version == 2 && (r) == 2))
+
 /*
- * Read version 2 iolog data. It is enhanced to include per-file logging,
+ * Read version 2 and 3 iolog data. It is enhanced to include per-file logging,
  * syncs, etc.
  */
-static bool read_iolog2(struct thread_data *td)
+static bool read_iolog(struct thread_data *td)
 {
 	unsigned long long offset;
 	unsigned int bytes;
+	unsigned long long delay = 0;
 	int reads, writes, waits, fileno = 0, file_action = 0; /* stupid gcc */
 	char *rfname, *fname, *act;
 	char *str, *p;
 	enum fio_ddir rw;
 	bool realloc = false;
 	int64_t items_to_fetch = 0;
+	int syncs;
 
 	if (td->o.read_iolog_chunked) {
 		items_to_fetch = iolog_items_to_fetch(td);
@@ -411,40 +461,62 @@ static bool read_iolog2(struct thread_data *td)
 	rfname = fname = malloc(256+16);
 	act = malloc(256+16);
 
-	reads = writes = waits = 0;
+	syncs = reads = writes = waits = 0;
 	while ((p = fgets(str, 4096, td->io_log_rfile)) != NULL) {
 		struct io_piece *ipo;
 		int r;
+		unsigned long long ttime;
 
-		r = sscanf(p, "%256s %256s %llu %u", rfname, act, &offset,
-									&bytes);
+		if (td->io_log_version == 3) {
+			r = sscanf(p, "%llu %256s %256s %llu %u", &ttime, rfname, act,
+							&offset, &bytes);
+			delay = delay_since_ttime(td, ttime);
+			td->io_log_last_ttime = ttime;
+			/*
+			 * "wait" is not allowed with version 3
+			 */
+			if (!strcmp(act, "wait")) {
+				log_err("iolog: ignoring wait command with"
+					" version 3 for file %s\n", fname);
+				continue;
+			}
+		} else /* version 2 */
+			r = sscanf(p, "%256s %256s %llu %u", rfname, act, &offset, &bytes);
 
 		if (td->o.replay_redirect)
 			fname = td->o.replay_redirect;
 
-		if (r == 4) {
+		if (io_act(td, r)) {
 			/*
 			 * Check action first
 			 */
 			if (!strcmp(act, "wait"))
 				rw = DDIR_WAIT;
-			else if (!strcmp(act, "read"))
+			else if (!strcmp(act, "read")) {
+				if (td->o.replay_skip & (1u << DDIR_READ))
+					continue;
 				rw = DDIR_READ;
-			else if (!strcmp(act, "write"))
+			} else if (!strcmp(act, "write")) {
+				if (td->o.replay_skip & (1u << DDIR_WRITE))
+					continue;
 				rw = DDIR_WRITE;
-			else if (!strcmp(act, "sync"))
+			} else if (!strcmp(act, "sync")) {
+				if (td->o.replay_skip & (1u << DDIR_SYNC))
+					continue;
 				rw = DDIR_SYNC;
-			else if (!strcmp(act, "datasync"))
+			} else if (!strcmp(act, "datasync"))
 				rw = DDIR_DATASYNC;
-			else if (!strcmp(act, "trim"))
+			else if (!strcmp(act, "trim")) {
+				if (td->o.replay_skip & (1u << DDIR_TRIM))
+					continue;
 				rw = DDIR_TRIM;
-			else {
+			} else {
 				log_err("fio: bad iolog file action: %s\n",
 									act);
 				continue;
 			}
 			fileno = get_fileno(td, fname);
-		} else if (r == 2) {
+		} else if (file_act(td, r)) {
 			rw = DDIR_INVAL;
 			if (!strcmp(act, "add")) {
 				if (td->o.replay_redirect &&
@@ -455,7 +527,6 @@ static bool read_iolog2(struct thread_data *td)
 					fileno = add_file(td, fname, td->subjob_number, 1);
 					file_action = FIO_LOG_ADD_FILE;
 				}
-				continue;
 			} else if (!strcmp(act, "open")) {
 				fileno = get_fileno(td, fname);
 				file_action = FIO_LOG_OPEN_FILE;
@@ -468,7 +539,7 @@ static bool read_iolog2(struct thread_data *td)
 				continue;
 			}
 		} else {
-			log_err("bad iolog2: %s\n", p);
+			log_err("bad iolog%d: %s\n", td->io_log_version, p);
 			continue;
 		}
 
@@ -486,7 +557,9 @@ static bool read_iolog2(struct thread_data *td)
 				continue;
 			waits++;
 		} else if (rw == DDIR_INVAL) {
-		} else if (!ddir_sync(rw)) {
+		} else if (ddir_sync(rw)) {
+			syncs++;
+		} else {
 			log_err("bad ddir: %d\n", rw);
 			continue;
 		}
@@ -497,6 +570,8 @@ static bool read_iolog2(struct thread_data *td)
 		ipo = calloc(1, sizeof(*ipo));
 		init_ipo(ipo);
 		ipo->ddir = rw;
+		if (td->io_log_version == 3)
+			ipo->delay = delay;
 		if (rw == DDIR_WAIT) {
 			ipo->delay = offset;
 		} else {
@@ -541,6 +616,8 @@ static bool read_iolog2(struct thread_data *td)
 			" read-only\n", td->o.name, writes);
 		writes = 0;
 	}
+	if (syncs)
+		td->flags |= TD_F_SYNCS;
 
 	if (td->o.read_iolog_chunked) {
 		if (td->io_log_current == 0) {
@@ -551,7 +628,8 @@ static bool read_iolog2(struct thread_data *td)
 		{
 			io_u_quiesce(td);
 			free_io_mem(td);
-			init_io_u_buffers(td);
+			if (init_io_u_buffers(td))
+				return false;
 		}
 		return true;
 	}
@@ -625,8 +703,6 @@ static bool init_iolog_read(struct thread_data *td, char *fname)
 	} else
 		f = fopen(fname, "r");
 
-	free(fname);
-
 	if (!f) {
 		perror("fopen read iolog");
 		return false;
@@ -641,18 +717,22 @@ static bool init_iolog_read(struct thread_data *td, char *fname)
 	}
 
 	/*
-	 * version 2 of the iolog stores a specific string as the
+	 * versions 2 and 3 of the iolog store a specific string as the
 	 * first line, check for that
 	 */
-	if (!strncmp(iolog_ver2, buffer, strlen(iolog_ver2))) {
-		free_release_files(td);
-		td->io_log_rfile = f;
-		return read_iolog2(td);
+	if (!strncmp(iolog_ver2, buffer, strlen(iolog_ver2)))
+		td->io_log_version = 2;
+	else if (!strncmp(iolog_ver3, buffer, strlen(iolog_ver3)))
+		td->io_log_version = 3;
+	else {
+		log_err("fio: iolog version 1 is no longer supported\n");
+		fclose(f);
+		return false;
 	}
 
-	log_err("fio: iolog version 1 is no longer supported\n");
-	fclose(f);
-	return false;
+	free_release_files(td);
+	td->io_log_rfile = f;
+	return read_iolog(td);
 }
 
 /*
@@ -676,11 +756,12 @@ static bool init_iolog_write(struct thread_data *td)
 	td->iolog_f = f;
 	td->iolog_buf = malloc(8192);
 	setvbuf(f, td->iolog_buf, _IOFBF, 8192);
+	fio_gettime(&td->io_log_start_time, NULL);
 
 	/*
 	 * write our version line
 	 */
-	if (fprintf(f, "%s\n", iolog_ver2) < 0) {
+	if (fprintf(f, "%s\n", iolog_ver3) < 0) {
 		perror("iolog init\n");
 		return false;
 	}
@@ -706,10 +787,14 @@ bool init_iolog(struct thread_data *td)
 		 * Check if it's a blktrace file and load that if possible.
 		 * Otherwise assume it's a normal log file and load that.
 		 */
-		if (is_blktrace(fname, &need_swap))
-			ret = load_blktrace(td, fname, need_swap);
-		else
+		if (is_blktrace(fname, &need_swap)) {
+			td->io_log_blktrace = 1;
+			ret = init_blktrace_read(td, fname, need_swap);
+		} else {
+			td->io_log_blktrace = 0;
 			ret = init_iolog_read(td, fname);
+		}
+		free(fname);
 	} else if (td->o.write_iolog_file)
 		ret = init_iolog_write(td);
 	else
@@ -733,6 +818,7 @@ void setup_log(struct io_log **log, struct log_params *p,
 	INIT_FLIST_HEAD(&l->io_logs);
 	l->log_type = p->log_type;
 	l->log_offset = p->log_offset;
+	l->log_prio = p->log_prio;
 	l->log_gz = p->log_gz;
 	l->log_gz_store = p->log_gz_store;
 	l->avg_msec = p->avg_msec;
@@ -765,6 +851,8 @@ void setup_log(struct io_log **log, struct log_params *p,
 
 	if (l->log_offset)
 		l->log_ddir_mask = LOG_OFFSET_SAMPLE_BIT;
+	if (l->log_prio)
+		l->log_ddir_mask |= LOG_PRIO_SAMPLE_BIT;
 
 	INIT_FLIST_HEAD(&l->chunk_list);
 
@@ -891,33 +979,55 @@ static void flush_hist_samples(FILE *f, int hist_coarseness, void *samples,
 void flush_samples(FILE *f, void *samples, uint64_t sample_size)
 {
 	struct io_sample *s;
-	int log_offset;
+	int log_offset, log_prio;
 	uint64_t i, nr_samples;
+	unsigned int prio_val;
+	const char *fmt;
 
 	if (!sample_size)
 		return;
 
 	s = __get_sample(samples, 0, 0);
 	log_offset = (s->__ddir & LOG_OFFSET_SAMPLE_BIT) != 0;
+	log_prio = (s->__ddir & LOG_PRIO_SAMPLE_BIT) != 0;
+
+	if (log_offset) {
+		if (log_prio)
+			fmt = "%lu, %" PRId64 ", %u, %llu, %llu, 0x%04x\n";
+		else
+			fmt = "%lu, %" PRId64 ", %u, %llu, %llu, %u\n";
+	} else {
+		if (log_prio)
+			fmt = "%lu, %" PRId64 ", %u, %llu, 0x%04x\n";
+		else
+			fmt = "%lu, %" PRId64 ", %u, %llu, %u\n";
+	}
 
 	nr_samples = sample_size / __log_entry_sz(log_offset);
 
 	for (i = 0; i < nr_samples; i++) {
 		s = __get_sample(samples, log_offset, i);
 
+		if (log_prio)
+			prio_val = s->priority;
+		else
+			prio_val = ioprio_value_is_class_rt(s->priority);
+
 		if (!log_offset) {
-			fprintf(f, "%lu, %" PRId64 ", %u, %llu, %u\n",
-					(unsigned long) s->time,
-					s->data.val,
-					io_sample_ddir(s), (unsigned long long) s->bs, s->priority_bit);
+			fprintf(f, fmt,
+				(unsigned long) s->time,
+				s->data.val,
+				io_sample_ddir(s), (unsigned long long) s->bs,
+				prio_val);
 		} else {
 			struct io_sample_offset *so = (void *) s;
 
-			fprintf(f, "%lu, %" PRId64 ", %u, %llu, %llu, %u\n",
-					(unsigned long) s->time,
-					s->data.val,
-					io_sample_ddir(s), (unsigned long long) s->bs,
-					(unsigned long long) so->offset, s->priority_bit);
+			fprintf(f, fmt,
+				(unsigned long) s->time,
+				s->data.val,
+				io_sample_ddir(s), (unsigned long long) s->bs,
+				(unsigned long long) so->offset,
+				prio_val);
 		}
 	}
 }
@@ -1117,7 +1227,7 @@ int iolog_file_inflate(const char *file)
 	void *buf;
 	FILE *f;
 
-	f = fopen(file, "r");
+	f = fopen(file, "rb");
 	if (!f) {
 		perror("fopen");
 		return 1;
@@ -1199,10 +1309,21 @@ void flush_log(struct io_log *log, bool do_append)
 	void *buf;
 	FILE *f;
 
+	/*
+	 * If log_gz_store is true, we are writing a binary file.
+	 * Set the mode appropriately (on all platforms) to avoid issues
+	 * on windows (line-ending conversions, etc.)
+	 */
 	if (!do_append)
-		f = fopen(log->filename, "w");
+		if (log->log_gz_store)
+			f = fopen(log->filename, "wb");
+		else
+			f = fopen(log->filename, "w");
 	else
-		f = fopen(log->filename, "a");
+		if (log->log_gz_store)
+			f = fopen(log->filename, "ab");
+		else
+			f = fopen(log->filename, "a");
 	if (!f) {
 		perror("fopen log");
 		return;
@@ -1473,14 +1594,14 @@ void iolog_compress_exit(struct thread_data *td)
  * Queue work item to compress the existing log entries. We reset the
  * current log to a small size, and reference the existing log in the
  * data that we queue for compression. Once compression has been done,
- * this old log is freed. If called with finish == true, will not return
- * until the log compression has completed, and will flush all previous
- * logs too
+ * this old log is freed. Will not return until the log compression
+ * has completed, and will flush all previous logs too
  */
 static int iolog_flush(struct io_log *log)
 {
 	struct iolog_flush_data *data;
 
+	workqueue_flush(&log->td->log_compress_wq);
 	data = malloc(sizeof(*data));
 	if (!data)
 		return 1;

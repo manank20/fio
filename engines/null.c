@@ -6,7 +6,8 @@
  *
  * It also can act as external C++ engine - compiled with:
  *
- * g++ -O2 -g -shared -rdynamic -fPIC -o cpp_null null.c -DFIO_EXTERNAL_ENGINE
+ * g++ -O2 -g -shared -rdynamic -fPIC -o cpp_null null.c \
+ *	-include ../config-host.h -DFIO_EXTERNAL_ENGINE
  *
  * to test it execute:
  *
@@ -43,9 +44,28 @@ static int null_getevents(struct null_data *nd, unsigned int min_events,
 	return ret;
 }
 
+static void null_queued(struct thread_data *td, struct null_data *nd)
+{
+	struct timespec now;
+
+	if (!fio_fill_issue_time(td))
+		return;
+
+	fio_gettime(&now, NULL);
+
+	for (int i = 0; i < nd->queued; i++) {
+		struct io_u *io_u = nd->io_us[i];
+
+		memcpy(&io_u->issue_time, &now, sizeof(now));
+		io_u_queued(td, io_u);
+	}
+}
+
 static int null_commit(struct thread_data *td, struct null_data *nd)
 {
 	if (!nd->events) {
+		null_queued(td, nd);
+
 #ifndef FIO_EXTERNAL_ENGINE
 		io_u_mark_submit(td, nd->queued);
 #endif
@@ -93,9 +113,11 @@ static struct null_data *null_init(struct thread_data *td)
 	if (td->o.iodepth != 1) {
 		nd->io_us = (struct io_u **) malloc(td->o.iodepth * sizeof(struct io_u *));
 		memset(nd->io_us, 0, td->o.iodepth * sizeof(struct io_u *));
+		td->io_ops->flags |= FIO_ASYNCIO_SETS_ISSUE_TIME;
 	} else
 		td->io_ops->flags |= FIO_SYNCIO;
 
+	td_set_ioengine_flags(td);
 	return nd;
 }
 
@@ -201,7 +223,7 @@ struct NullData {
 		return null_commit(td, impl_);
 	}
 
-	int fio_null_queue(struct thread_data *td, struct io_u *io_u)
+	fio_q_status fio_null_queue(struct thread_data *td, struct io_u *io_u)
 	{
 		return null_queue(td, impl_, io_u);
 	}
@@ -233,7 +255,7 @@ static int fio_null_commit(struct thread_data *td)
 	return NullData::get(td)->fio_null_commit(td);
 }
 
-static int fio_null_queue(struct thread_data *td, struct io_u *io_u)
+static fio_q_status fio_null_queue(struct thread_data *td, struct io_u *io_u)
 {
 	return NullData::get(td)->fio_null_queue(td, io_u);
 }

@@ -38,6 +38,13 @@
 #define FIO_USE_GENERIC_SWAP
 
 #define FIO_OS_HAVE_AIOCB_TYPEDEF
+
+#ifdef CONFIG_PTHREAD_GETAFFINITY
+#define FIO_HAVE_GET_THREAD_AFFINITY
+#define fio_get_thread_affinity(mask)	\
+	pthread_getaffinity_np(pthread_self(), sizeof(mask), &(mask))
+#endif
+
 typedef struct aiocb64 os_aiocb_t;
 
 static inline int blockdev_invalidate_cache(struct fio_file *f)
@@ -81,9 +88,9 @@ static inline unsigned long long os_phys_mem(void)
 	return ret;
 }
 
-#define FIO_HAVE_CPU_ONLINE_SYSCONF
+#define FIO_HAVE_CPU_CONF_SYSCONF
 
-static inline unsigned int cpus_online(void)
+static inline unsigned int cpus_configured(void)
 {
 	return mpctl(MPC_GETNUMSPUS, 0, NULL);
 }

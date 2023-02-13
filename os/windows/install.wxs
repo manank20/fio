@@ -33,13 +33,13 @@
 						</Component>
 						<?endif?>
 						<Component>
-							<File Id="README" Name="README.txt" Source="..\..\README"/>
+							<File Id="README" Name="README.txt" Source="..\..\README.rst"/>
 						</Component>
 						<Component>
 							<File Id="REPORTING_BUGS" Name="REPORTING-BUGS.txt" Source="..\..\REPORTING-BUGS"/>
 						</Component>
 						<Component>
-							<File Id="HOWTO" Name="HOWTO.txt" Source="..\..\HOWTO"/>
+							<File Id="HOWTO" Name="HOWTO.txt" Source="..\..\HOWTO.rst"/>
 						</Component>
 						<Component>
 							<File Id="COPYING" Name="COPYING.txt" Source="..\..\COPYING"/>
@@ -107,7 +107,7 @@
 
 	<WixVariable Id="WixUILicenseRtf" Value="eula.rtf" />
 
-	<UIRef Id="WixUI_Minimal"/>
+	<UIRef Id="WixUI_Minimal_NoEULA"/>
 
 	<MajorUpgrade AllowDowngrades="no" DowngradeErrorMessage="A newer version of the application is already installed."
                   AllowSameVersionUpgrades="yes"/>

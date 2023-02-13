@@ -13,7 +13,7 @@
 #include <sys/endian.h>
 #include <sys/sysctl.h>
 
-/* XXX hack to avoid confilcts between rbtree.h and <sys/rbtree.h> */
+/* XXX hack to avoid conflicts between rbtree.h and <sys/rbtree.h> */
 #undef rb_node
 #undef rb_left
 #undef rb_right
@@ -34,6 +34,12 @@
 #define fio_swap16(x)	bswap16(x)
 #define fio_swap32(x)	bswap32(x)
 #define fio_swap64(x)	bswap64(x)
+
+#ifdef CONFIG_PTHREAD_GETAFFINITY
+#define FIO_HAVE_GET_THREAD_AFFINITY
+#define fio_get_thread_affinity(mask)	\
+	pthread_getaffinity_np(pthread_self(), sizeof(mask), &(mask))
+#endif
 
 static inline int blockdev_size(struct fio_file *f, unsigned long long *bytes)
 {

@@ -3,6 +3,7 @@
  */
 #include <unistd.h>
 #include <string.h>
+#include <stdlib.h>
 #ifdef CONFIG_VALGRIND_DEV
 #include <valgrind/drd.h>
 #else
@@ -420,6 +421,7 @@ bool calc_thread_status(struct jobs_eta *je, int force)
 		if (is_power_of_2(td->o.kb_base))
 			je->is_pow2 = 1;
 		je->unit_base = td->o.unit_base;
+		je->sig_figs = td->o.sig_figs;
 		if (td->o.bw_avg_time < bw_avg_time)
 			bw_avg_time = td->o.bw_avg_time;
 		if (td->runstate == TD_RUNNING || td->runstate == TD_VERIFYING
@@ -509,7 +511,7 @@ bool calc_thread_status(struct jobs_eta *je, int force)
 		memcpy(&rate_prev_time, &now, sizeof(now));
 		regrow_agg_logs();
 		for_each_rw_ddir(ddir) {
-			add_agg_sample(sample_val(je->rate[ddir]), ddir, 0, 0);
+			add_agg_sample(sample_val(je->rate[ddir]), ddir, 0);
 		}
 	}
 
@@ -600,9 +602,9 @@ void display_thread_status(struct jobs_eta *je)
 		char *tr, *mr;
 
 		mr = num2str(je->m_rate[0] + je->m_rate[1] + je->m_rate[2],
-				je->sig_figs, 0, je->is_pow2, N2S_BYTEPERSEC);
+				je->sig_figs, 1, je->is_pow2, N2S_BYTEPERSEC);
 		tr = num2str(je->t_rate[0] + je->t_rate[1] + je->t_rate[2],
-				je->sig_figs, 0, je->is_pow2, N2S_BYTEPERSEC);
+				je->sig_figs, 1, je->is_pow2, N2S_BYTEPERSEC);
 
 		p += sprintf(p, ", %s-%s", mr, tr);
 		free(tr);
@@ -706,10 +708,10 @@ void print_thread_status(void)
 	size_t size;
 
 	je = get_jobs_eta(false, &size);
-	if (je)
+	if (je) {
 		display_thread_status(je);
-
-	free(je);
+		free(je);
+	}
 }
 
 void print_status_init(int thr_number)

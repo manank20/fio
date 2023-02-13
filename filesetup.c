@@ -226,11 +226,16 @@ static int extend_file(struct thread_data *td, struct fio_file *f)
 			if (r < 0) {
 				int __e = errno;
 
-				if (__e == ENOSPC) {
+				if (__e == ENOSPC || __e == EDQUOT) {
+					const char *__e_name;
 					if (td->o.fill_device)
 						break;
-					log_info("fio: ENOSPC on laying out "
-						 "file, stopping\n");
+					if (__e == ENOSPC)
+						__e_name = "ENOSPC";
+					else
+						__e_name = "EDQUOT";
+					log_info("fio: %s on laying out "
+						 "file, stopping\n", __e_name);
 				}
 				td_verror(td, errno, "write");
 			} else
@@ -763,7 +768,7 @@ open_again:
 		else
 			from_hash = file_lookup_open(f, flags);
 	} else if (td_read(td)) {
-		if (f->filetype == FIO_TYPE_CHAR && !read_only)
+		if (td_ioengine_flagged(td, FIO_RO_NEEDS_RW_OPEN) && !read_only)
 			flags |= O_RDWR;
 		else
 			flags |= O_RDONLY;
@@ -1019,7 +1024,6 @@ int longest_existing_path(char *path) {
 	while (!done) {
 		buf_pos = strrchr(buf, FIO_OS_PATH_SEPARATOR);
 		if (!buf_pos) {
-			done = true;
 			offset = 0;
 			break;
 		}
@@ -1115,15 +1119,15 @@ int setup_files(struct thread_data *td)
 	if (err)
 		goto err_out;
 
-	if (o->read_iolog_file)
-		goto done;
-
 	if (td->o.zone_mode == ZONE_MODE_ZBD) {
 		err = zbd_init_files(td);
 		if (err)
 			goto err_out;
 	}
 	zbd_recalc_options_with_zone_granularity(td);
+
+	if (o->read_iolog_file)
+		goto done;
 
 	/*
 	 * check sizes. if the files/devices do not exist and the size
@@ -1450,7 +1454,7 @@ static void __init_rand_distribution(struct thread_data *td, struct fio_file *f)
 
 	seed = jhash(f->file_name, strlen(f->file_name), 0) * td->thread_number;
 	if (!td->o.rand_repeatable)
-		seed = td->rand_seeds[4];
+		seed = td->rand_seeds[FIO_RAND_BLOCK_OFF];
 
 	if (td->o.random_distribution == FIO_RAND_DIST_ZIPF)
 		zipf_init(&f->zipf, nranges, td->o.zipf_theta.u.f, td->o.random_center.u.f, seed);
@@ -1482,7 +1486,7 @@ static bool init_rand_distribution(struct thread_data *td)
 
 /*
  * Check if the number of blocks exceeds the randomness capability of
- * the selected generator. Tausworthe is 32-bit, the others are fullly
+ * the selected generator. Tausworthe is 32-bit, the others are fully
  * 64-bit capable.
  */
 static int check_rand_gen_limits(struct thread_data *td, struct fio_file *f,
@@ -2027,11 +2031,12 @@ void dup_files(struct thread_data *td, struct thread_data *org)
 	if (!org->files)
 		return;
 
-	td->files = malloc(org->files_index * sizeof(f));
+	td->files = calloc(org->files_index, sizeof(f));
 
 	if (td->o.file_lock_mode != FILE_LOCK_NONE)
 		td->file_locks = malloc(org->files_index);
 
+	assert(org->files_index >= org->o.nr_files);
 	for_each_file(org, f, i) {
 		struct fio_file *__f;
 

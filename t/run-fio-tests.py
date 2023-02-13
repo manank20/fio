@@ -49,12 +49,13 @@ import shutil
 import logging
 import argparse
 import platform
+import traceback
 import subprocess
 import multiprocessing
 from pathlib import Path
 
 
-class FioTest(object):
+class FioTest():
     """Base for all fio tests."""
 
     def __init__(self, exe_path, parameters, success):
@@ -285,6 +286,19 @@ class FioJobTest(FioExeTest):
 
         return file_data, success
 
+    def get_file_fail(self, filename):
+        """Safely read a file and fail the test upon error."""
+        file_data = None
+
+        try:
+            with open(filename, "r") as output_file:
+                file_data = output_file.read()
+        except OSError:
+            self.failure_reason += " unable to read file {0}".format(filename)
+            self.passed = False
+
+        return file_data
+
     def check_result(self):
         """Check fio job results."""
 
@@ -301,30 +315,22 @@ class FioJobTest(FioExeTest):
         if 'json' not in self.output_format:
             return
 
-        file_data, success = self.get_file(os.path.join(self.test_dir, self.fio_output))
-        if not success:
-            self.failure_reason = "{0} unable to open output file,".format(self.failure_reason)
-            self.passed = False
+        file_data = self.get_file_fail(os.path.join(self.test_dir, self.fio_output))
+        if not file_data:
             return
 
         #
         # Sometimes fio informational messages are included at the top of the
         # JSON output, especially under Windows. Try to decode output as JSON
-        # data, lopping off up to the first four lines
+        # data, skipping everything until the first {
         #
         lines = file_data.splitlines()
-        for i in range(5):
-            file_data = '\n'.join(lines[i:])
-            try:
-                self.json_data = json.loads(file_data)
-            except json.JSONDecodeError:
-                continue
-            else:
-                logging.debug("Test %d: skipped %d lines decoding JSON data", self.testnum, i)
-                return
-
-        self.failure_reason = "{0} unable to decode JSON data,".format(self.failure_reason)
-        self.passed = False
+        file_data = '\n'.join(lines[lines.index("{"):])
+        try:
+            self.json_data = json.loads(file_data)
+        except json.JSONDecodeError:
+            self.failure_reason = "{0} unable to decode JSON data,".format(self.failure_reason)
+            self.passed = False
 
 
 class FioJobTest_t0005(FioJobTest):
@@ -381,10 +387,13 @@ class FioJobTest_t0007(FioJobTest):
 class FioJobTest_t0008(FioJobTest):
     """Test consists of fio test job t0008
     Confirm that read['io_kbytes'] = 32768 and that
-                write['io_kbytes'] ~ 16568
+                write['io_kbytes'] ~ 16384
 
-    I did runs with fio-ae2fafc8 and saw write['io_kbytes'] values of
-    16585, 16588. With two runs of fio-3.16 I obtained 16568"""
+    This is a 50/50 seq read/write workload. Since fio flips a coin to
+    determine whether to issue a read or a write, total bytes written will not
+    be exactly 16384K. But total bytes read will be exactly 32768K because
+    reads will include the initial phase as well as the verify phase where all
+    the blocks originally written will be read."""
 
     def check_result(self):
         super(FioJobTest_t0008, self).check_result()
@@ -392,10 +401,10 @@ class FioJobTest_t0008(FioJobTest):
         if not self.passed:
             return
 
-        ratio = self.json_data['jobs'][0]['write']['io_kbytes'] / 16568
+        ratio = self.json_data['jobs'][0]['write']['io_kbytes'] / 16384
         logging.debug("Test %d: ratio: %f", self.testnum, ratio)
 
-        if ratio < 0.99 or ratio > 1.01:
+        if ratio < 0.97 or ratio > 1.03:
             self.failure_reason = "{0} bytes written mismatch,".format(self.failure_reason)
             self.passed = False
         if self.json_data['jobs'][0]['read']['io_kbytes'] != 32768:
@@ -432,12 +441,11 @@ class FioJobTest_t0012(FioJobTest):
             return
 
         iops_files = []
-        for i in range(1,4):
-            file_data, success = self.get_file(os.path.join(self.test_dir, "{0}_iops.{1}.log".format(os.path.basename(self.fio_job), i)))
-
-            if not success:
-                self.failure_reason = "{0} unable to open output file,".format(self.failure_reason)
-                self.passed = False
+        for i in range(1, 4):
+            filename = os.path.join(self.test_dir, "{0}_iops.{1}.log".format(os.path.basename(
+                self.fio_job), i))
+            file_data = self.get_file_fail(filename)
+            if not file_data:
                 return
 
             iops_files.append(file_data.splitlines())
@@ -453,17 +461,15 @@ class FioJobTest_t0012(FioJobTest):
 
             ratio1 = iops3/iops2
             ratio2 = iops3/iops1
-            logging.debug(
-                "sample {0}: job1 iops={1} job2 iops={2} job3 iops={3} job3/job2={4:.3f} job3/job1={5:.3f}".format(
-                    i, iops1, iops2, iops3, ratio1, ratio2
-                )
-            )
+            logging.debug("sample {0}: job1 iops={1} job2 iops={2} job3 iops={3} " \
+                "job3/job2={4:.3f} job3/job1={5:.3f}".format(i, iops1, iops2, iops3, ratio1,
+                                                             ratio2))
 
         # test job1 and job2 succeeded to recalibrate
         if ratio1 < 1 or ratio1 > 3 or ratio2 < 7 or ratio2 > 13:
-            self.failure_reason = "{0} iops ratio mismatch iops1={1} iops2={2} iops3={3} expected r1~2 r2~10 got r1={4:.3f} r2={5:.3f},".format(
-                self.failure_reason, iops1, iops2, iops3, ratio1, ratio2
-            )
+            self.failure_reason += " iops ratio mismatch iops1={0} iops2={1} iops3={2} " \
+                "expected r1~2 r2~10 got r1={3:.3f} r2={4:.3f},".format(iops1, iops2, iops3,
+                                                                        ratio1, ratio2)
             self.passed = False
             return
 
@@ -483,12 +489,11 @@ class FioJobTest_t0014(FioJobTest):
             return
 
         iops_files = []
-        for i in range(1,4):
-            file_data, success = self.get_file(os.path.join(self.test_dir, "{0}_iops.{1}.log".format(os.path.basename(self.fio_job), i)))
-
-            if not success:
-                self.failure_reason = "{0} unable to open output file,".format(self.failure_reason)
-                self.passed = False
+        for i in range(1, 4):
+            filename = os.path.join(self.test_dir, "{0}_iops.{1}.log".format(os.path.basename(
+                self.fio_job), i))
+            file_data = self.get_file_fail(filename)
+            if not file_data:
                 return
 
             iops_files.append(file_data.splitlines())
@@ -506,10 +511,9 @@ class FioJobTest_t0014(FioJobTest):
 
 
                 if ratio1 < 0.43 or ratio1 > 0.57 or ratio2 < 0.21 or ratio2 > 0.45:
-                    self.failure_reason = "{0} iops ratio mismatch iops1={1} iops2={2} iops3={3}\
-                                                expected r1~0.5 r2~0.33 got r1={4:.3f} r2={5:.3f},".format(
-                        self.failure_reason, iops1, iops2, iops3, ratio1, ratio2
-                    )
+                    self.failure_reason += " iops ratio mismatch iops1={0} iops2={1} iops3={2} " \
+                                           "expected r1~0.5 r2~0.33 got r1={3:.3f} r2={4:.3f},".format(
+                                               iops1, iops2, iops3, ratio1, ratio2)
                     self.passed = False
 
             iops1 = iops1 + float(iops_files[0][i].split(',')[1])
@@ -517,20 +521,307 @@ class FioJobTest_t0014(FioJobTest):
 
             ratio1 = iops1/iops2
             ratio2 = iops1/iops3
-            logging.debug(
-                "sample {0}: job1 iops={1} job2 iops={2} job3 iops={3} job1/job2={4:.3f} job1/job3={5:.3f}".format(
-                    i, iops1, iops2, iops3, ratio1, ratio2
-                )
-            )
+            logging.debug("sample {0}: job1 iops={1} job2 iops={2} job3 iops={3} " \
+                          "job1/job2={4:.3f} job1/job3={5:.3f}".format(i, iops1, iops2, iops3,
+                                                                       ratio1, ratio2))
 
         # test job1 and job2 succeeded to recalibrate
         if ratio1 < 0.43 or ratio1 > 0.57:
-            self.failure_reason = "{0} iops ratio mismatch iops1={1} iops2={2} expected ratio~0.5 got ratio={3:.3f},".format(
-                self.failure_reason, iops1, iops2, ratio1
-            )
+            self.failure_reason += " iops ratio mismatch iops1={0} iops2={1} expected ratio~0.5 " \
+                                   "got ratio={2:.3f},".format(iops1, iops2, ratio1)
             self.passed = False
             return
 
+
+class FioJobTest_t0015(FioJobTest):
+    """Test consists of fio test jobs t0015 and t0016
+    Confirm that mean(slat) + mean(clat) = mean(tlat)"""
+
+    def check_result(self):
+        super(FioJobTest_t0015, self).check_result()
+
+        if not self.passed:
+            return
+
+        slat = self.json_data['jobs'][0]['read']['slat_ns']['mean']
+        clat = self.json_data['jobs'][0]['read']['clat_ns']['mean']
+        tlat = self.json_data['jobs'][0]['read']['lat_ns']['mean']
+        logging.debug('Test %d: slat %f, clat %f, tlat %f', self.testnum, slat, clat, tlat)
+
+        if abs(slat + clat - tlat) > 1:
+            self.failure_reason = "{0} slat {1} + clat {2} = {3} != tlat {4},".format(
+                self.failure_reason, slat, clat, slat+clat, tlat)
+            self.passed = False
+
+
+class FioJobTest_t0019(FioJobTest):
+    """Test consists of fio test job t0019
+    Confirm that all offsets were touched sequentially"""
+
+    def check_result(self):
+        super(FioJobTest_t0019, self).check_result()
+
+        bw_log_filename = os.path.join(self.test_dir, "test_bw.log")
+        file_data = self.get_file_fail(bw_log_filename)
+        if not file_data:
+            return
+
+        log_lines = file_data.split('\n')
+
+        prev = -4096
+        for line in log_lines:
+            if len(line.strip()) == 0:
+                continue
+            cur = int(line.split(',')[4])
+            if cur - prev != 4096:
+                self.passed = False
+                self.failure_reason = "offsets {0}, {1} not sequential".format(prev, cur)
+                return
+            prev = cur
+
+        if cur/4096 != 255:
+            self.passed = False
+            self.failure_reason = "unexpected last offset {0}".format(cur)
+
+
+class FioJobTest_t0020(FioJobTest):
+    """Test consists of fio test jobs t0020 and t0021
+    Confirm that almost all offsets were touched non-sequentially"""
+
+    def check_result(self):
+        super(FioJobTest_t0020, self).check_result()
+
+        bw_log_filename = os.path.join(self.test_dir, "test_bw.log")
+        file_data = self.get_file_fail(bw_log_filename)
+        if not file_data:
+            return
+
+        log_lines = file_data.split('\n')
+
+        seq_count = 0
+        offsets = set()
+
+        prev = int(log_lines[0].split(',')[4])
+        for line in log_lines[1:]:
+            offsets.add(prev/4096)
+            if len(line.strip()) == 0:
+                continue
+            cur = int(line.split(',')[4])
+            if cur - prev == 4096:
+                seq_count += 1
+            prev = cur
+
+        # 10 is an arbitrary threshold
+        if seq_count > 10:
+            self.passed = False
+            self.failure_reason = "too many ({0}) consecutive offsets".format(seq_count)
+
+        if len(offsets) != 256:
+            self.passed = False
+            self.failure_reason += " number of offsets is {0} instead of 256".format(len(offsets))
+
+        for i in range(256):
+            if not i in offsets:
+                self.passed = False
+                self.failure_reason += " missing offset {0}".format(i*4096)
+
+
+class FioJobTest_t0022(FioJobTest):
+    """Test consists of fio test job t0022"""
+
+    def check_result(self):
+        super(FioJobTest_t0022, self).check_result()
+
+        bw_log_filename = os.path.join(self.test_dir, "test_bw.log")
+        file_data = self.get_file_fail(bw_log_filename)
+        if not file_data:
+            return
+
+        log_lines = file_data.split('\n')
+
+        filesize = 1024*1024
+        bs = 4096
+        seq_count = 0
+        offsets = set()
+
+        prev = int(log_lines[0].split(',')[4])
+        for line in log_lines[1:]:
+            offsets.add(prev/bs)
+            if len(line.strip()) == 0:
+                continue
+            cur = int(line.split(',')[4])
+            if cur - prev == bs:
+                seq_count += 1
+            prev = cur
+
+        # 10 is an arbitrary threshold
+        if seq_count > 10:
+            self.passed = False
+            self.failure_reason = "too many ({0}) consecutive offsets".format(seq_count)
+
+        if len(offsets) == filesize/bs:
+            self.passed = False
+            self.failure_reason += " no duplicate offsets found with norandommap=1"
+
+
+class FioJobTest_t0023(FioJobTest):
+    """Test consists of fio test job t0023 randtrimwrite test."""
+
+    def check_trimwrite(self, filename):
+        """Make sure that trims are followed by writes of the same size at the same offset."""
+
+        bw_log_filename = os.path.join(self.test_dir, filename)
+        file_data = self.get_file_fail(bw_log_filename)
+        if not file_data:
+            return
+
+        log_lines = file_data.split('\n')
+
+        prev_ddir = 1
+        for line in log_lines:
+            if len(line.strip()) == 0:
+                continue
+            vals = line.split(',')
+            ddir = int(vals[2])
+            bs = int(vals[3])
+            offset = int(vals[4])
+            if prev_ddir == 1:
+                if ddir != 2:
+                    self.passed = False
+                    self.failure_reason += " {0}: write not preceeded by trim: {1}".format(
+                        bw_log_filename, line)
+                    break
+            else:
+                if ddir != 1:
+                    self.passed = False
+                    self.failure_reason += " {0}: trim not preceeded by write: {1}".format(
+                        bw_log_filename, line)
+                    break
+                else:
+                    if prev_bs != bs:
+                        self.passed = False
+                        self.failure_reason += " {0}: block size does not match: {1}".format(
+                            bw_log_filename, line)
+                        break
+                    if prev_offset != offset:
+                        self.passed = False
+                        self.failure_reason += " {0}: offset does not match: {1}".format(
+                            bw_log_filename, line)
+                        break
+            prev_ddir = ddir
+            prev_bs = bs
+            prev_offset = offset
+
+
+    def check_all_offsets(self, filename, sectorsize, filesize):
+        """Make sure all offsets were touched."""
+
+        file_data = self.get_file_fail(os.path.join(self.test_dir, filename))
+        if not file_data:
+            return
+
+        log_lines = file_data.split('\n')
+
+        offsets = set()
+
+        for line in log_lines:
+            if len(line.strip()) == 0:
+                continue
+            vals = line.split(',')
+            bs = int(vals[3])
+            offset = int(vals[4])
+            if offset % sectorsize != 0:
+                self.passed = False
+                self.failure_reason += " {0}: offset {1} not a multiple of sector size {2}".format(
+                    filename, offset, sectorsize)
+                break
+            if bs % sectorsize != 0:
+                self.passed = False
+                self.failure_reason += " {0}: block size {1} not a multiple of sector size " \
+                    "{2}".format(filename, bs, sectorsize)
+                break
+            for i in range(int(bs/sectorsize)):
+                offsets.add(offset/sectorsize + i)
+
+        if len(offsets) != filesize/sectorsize:
+            self.passed = False
+            self.failure_reason += " {0}: only {1} offsets touched; expected {2}".format(
+                filename, len(offsets), filesize/sectorsize)
+        else:
+            logging.debug("%s: %d sectors touched", filename, len(offsets))
+
+
+    def check_result(self):
+        super(FioJobTest_t0023, self).check_result()
+
+        filesize = 1024*1024
+
+        self.check_trimwrite("basic_bw.log")
+        self.check_trimwrite("bs_bw.log")
+        self.check_trimwrite("bsrange_bw.log")
+        self.check_trimwrite("bssplit_bw.log")
+        self.check_trimwrite("basic_no_rm_bw.log")
+        self.check_trimwrite("bs_no_rm_bw.log")
+        self.check_trimwrite("bsrange_no_rm_bw.log")
+        self.check_trimwrite("bssplit_no_rm_bw.log")
+
+        self.check_all_offsets("basic_bw.log", 4096, filesize)
+        self.check_all_offsets("bs_bw.log", 8192, filesize)
+        self.check_all_offsets("bsrange_bw.log", 512, filesize)
+        self.check_all_offsets("bssplit_bw.log", 512, filesize)
+
+
+class FioJobTest_t0024(FioJobTest_t0023):
+    """Test consists of fio test job t0024 trimwrite test."""
+
+    def check_result(self):
+        # call FioJobTest_t0023's parent to skip checks done by t0023
+        super(FioJobTest_t0023, self).check_result()
+
+        filesize = 1024*1024
+
+        self.check_trimwrite("basic_bw.log")
+        self.check_trimwrite("bs_bw.log")
+        self.check_trimwrite("bsrange_bw.log")
+        self.check_trimwrite("bssplit_bw.log")
+
+        self.check_all_offsets("basic_bw.log", 4096, filesize)
+        self.check_all_offsets("bs_bw.log", 8192, filesize)
+        self.check_all_offsets("bsrange_bw.log", 512, filesize)
+        self.check_all_offsets("bssplit_bw.log", 512, filesize)
+
+
+class FioJobTest_t0025(FioJobTest):
+    """Test experimental verify read backs written data pattern."""
+    def check_result(self):
+        super(FioJobTest_t0025, self).check_result()
+
+        if not self.passed:
+            return
+
+        if self.json_data['jobs'][0]['read']['io_kbytes'] != 128:
+            self.passed = False
+
+class FioJobTest_t0027(FioJobTest):
+    def setup(self, *args, **kws):
+        super(FioJobTest_t0027, self).setup(*args, **kws)
+        self.pattern_file = os.path.join(self.test_dir, "t0027.pattern")
+        self.output_file = os.path.join(self.test_dir, "t0027file")
+        self.pattern = os.urandom(16 << 10)
+        with open(self.pattern_file, "wb") as f:
+            f.write(self.pattern)
+
+    def check_result(self):
+        super(FioJobTest_t0027, self).check_result()
+
+        if not self.passed:
+            return
+
+        with open(self.output_file, "rb") as f:
+            data = f.read()
+
+        if data != self.pattern:
+            self.passed = False
 
 class FioJobTest_iops_rate(FioJobTest):
     """Test consists of fio test job t0009
@@ -545,9 +836,10 @@ class FioJobTest_iops_rate(FioJobTest):
             return
 
         iops1 = self.json_data['jobs'][0]['read']['iops']
-        iops2 = self.json_data['jobs'][1]['read']['iops']
-        ratio = iops2 / iops1
         logging.debug("Test %d: iops1: %f", self.testnum, iops1)
+        iops2 = self.json_data['jobs'][1]['read']['iops']
+        logging.debug("Test %d: iops2: %f", self.testnum, iops2)
+        ratio = iops2 / iops1
         logging.debug("Test %d: ratio: %f", self.testnum, ratio)
 
         if iops1 < 950 or iops1 > 1050:
@@ -559,12 +851,13 @@ class FioJobTest_iops_rate(FioJobTest):
             self.passed = False
 
 
-class Requirements(object):
+class Requirements():
     """Requirements consists of multiple run environment characteristics.
     These are to determine if a particular test can be run"""
 
     _linux = False
     _libaio = False
+    _io_uring = False
     _zbd = False
     _root = False
     _zoned_nullb = False
@@ -588,6 +881,12 @@ class Requirements(object):
                 Requirements._zbd = "CONFIG_HAS_BLKZONED" in contents
                 Requirements._libaio = "CONFIG_LIBAIO" in contents
 
+            contents, success = FioJobTest.get_file("/proc/kallsyms")
+            if not success:
+                print("Unable to open '/proc/kallsyms' to probe for io_uring support")
+            else:
+                Requirements._io_uring = "io_uring_setup" in contents
+
             Requirements._root = (os.geteuid() == 0)
             if Requirements._zbd and Requirements._root:
                 try:
@@ -610,6 +909,7 @@ class Requirements(object):
 
         req_list = [Requirements.linux,
                     Requirements.libaio,
+                    Requirements.io_uring,
                     Requirements.zbd,
                     Requirements.root,
                     Requirements.zoned_nullb,
@@ -630,6 +930,11 @@ class Requirements(object):
     def libaio(cls):
         """Is libaio available?"""
         return Requirements._libaio, "libaio required"
+
+    @classmethod
+    def io_uring(cls):
+        """Is io_uring available?"""
+        return Requirements._io_uring, "io_uring required"
 
     @classmethod
     def zbd(cls):
@@ -821,6 +1126,136 @@ TEST_LIST = [
         'requirements':     [],
     },
     {
+        'test_id':          15,
+        'test_class':       FioJobTest_t0015,
+        'job':              't0015-e78980ff.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'output_format':    'json',
+        'requirements':     [Requirements.linux, Requirements.libaio],
+    },
+    {
+        'test_id':          16,
+        'test_class':       FioJobTest_t0015,
+        'job':              't0016-d54ae22.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'output_format':    'json',
+        'requirements':     [],
+    },
+    {
+        'test_id':          17,
+        'test_class':       FioJobTest_t0015,
+        'job':              't0017.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'output_format':    'json',
+        'requirements':     [Requirements.not_windows],
+    },
+    {
+        'test_id':          18,
+        'test_class':       FioJobTest,
+        'job':              't0018.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'requirements':     [Requirements.linux, Requirements.io_uring],
+    },
+    {
+        'test_id':          19,
+        'test_class':       FioJobTest_t0019,
+        'job':              't0019.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'requirements':     [],
+    },
+    {
+        'test_id':          20,
+        'test_class':       FioJobTest_t0020,
+        'job':              't0020.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'requirements':     [],
+    },
+    {
+        'test_id':          21,
+        'test_class':       FioJobTest_t0020,
+        'job':              't0021.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'requirements':     [],
+    },
+    {
+        'test_id':          22,
+        'test_class':       FioJobTest_t0022,
+        'job':              't0022.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'requirements':     [],
+    },
+    {
+        'test_id':          23,
+        'test_class':       FioJobTest_t0023,
+        'job':              't0023.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'requirements':     [],
+    },
+    {
+        'test_id':          24,
+        'test_class':       FioJobTest_t0024,
+        'job':              't0024.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'requirements':     [],
+    },
+    {
+        'test_id':          25,
+        'test_class':       FioJobTest_t0025,
+        'job':              't0025.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'output_format':    'json',
+        'requirements':     [],
+    },
+    {
+        'test_id':          26,
+        'test_class':       FioJobTest,
+        'job':              't0026.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'requirements':     [Requirements.not_windows],
+    },
+    {
+        'test_id':          27,
+        'test_class':       FioJobTest_t0027,
+        'job':              't0027.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'requirements':     [],
+    },
+    {
+        'test_id':          28,
+        'test_class':       FioJobTest,
+        'job':              't0028-c6cade16.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'requirements':     [],
+    },
+    {
         'test_id':          1000,
         'test_class':       FioExeTest,
         'exe':              't/axmap',
@@ -914,6 +1349,14 @@ TEST_LIST = [
         'test_id':          1011,
         'test_class':       FioExeTest,
         'exe':              't/jsonplus2csv_test.py',
+        'parameters':       ['-f', '{fio_path}'],
+        'success':          SUCCESS_DEFAULT,
+        'requirements':     [],
+    },
+    {
+        'test_id':          1012,
+        'test_class':       FioExeTest,
+        'exe':              't/log_compression.py',
         'parameters':       ['-f', '{fio_path}'],
         'success':          SUCCESS_DEFAULT,
         'requirements':     [],
@@ -1057,9 +1500,16 @@ def main():
                 skipped = skipped + 1
                 continue
 
-        test.setup(artifact_root, config['test_id'])
-        test.run()
-        test.check_result()
+        try:
+            test.setup(artifact_root, config['test_id'])
+            test.run()
+            test.check_result()
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            test.passed = False
+            test.failure_reason += str(e)
+            logging.debug("Test %d exception:\n%s\n", config['test_id'], traceback.format_exc())
         if test.passed:
             result = "PASSED"
             passed = passed + 1

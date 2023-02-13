@@ -42,7 +42,7 @@ struct io_sample {
 	uint64_t time;
 	union io_sample_data data;
 	uint32_t __ddir;
-	uint8_t priority_bit;
+	uint16_t priority;
 	uint64_t bs;
 };
 
@@ -105,6 +105,11 @@ struct io_log {
 	unsigned int log_offset;
 
 	/*
+	 * Log I/O priorities
+	 */
+	unsigned int log_prio;
+
+	/*
 	 * Max size of log entries before a chunk is compressed
 	 */
 	unsigned int log_gz;
@@ -145,7 +150,13 @@ struct io_log {
  * If the upper bit is set, then we have the offset as well
  */
 #define LOG_OFFSET_SAMPLE_BIT	0x80000000U
-#define io_sample_ddir(io)	((io)->__ddir & ~LOG_OFFSET_SAMPLE_BIT)
+/*
+ * If the bit following the upper bit is set, then we have the priority
+ */
+#define LOG_PRIO_SAMPLE_BIT	0x40000000U
+
+#define LOG_SAMPLE_BITS		(LOG_OFFSET_SAMPLE_BIT | LOG_PRIO_SAMPLE_BIT)
+#define io_sample_ddir(io)	((io)->__ddir & ~LOG_SAMPLE_BITS)
 
 static inline void io_sample_set_ddir(struct io_log *log,
 				      struct io_sample *io,
@@ -216,10 +227,8 @@ struct io_piece {
 	unsigned long len;
 	unsigned int flags;
 	enum fio_ddir ddir;
-	union {
-		unsigned long delay;
-		unsigned int file_action;
-	};
+	unsigned long delay;
+	unsigned int file_action;
 };
 
 /*
@@ -243,10 +252,13 @@ extern void trim_io_piece(const struct io_u *);
 extern void queue_io_piece(struct thread_data *, struct io_piece *);
 extern void prune_io_piece_log(struct thread_data *);
 extern void write_iolog_close(struct thread_data *);
+int64_t iolog_items_to_fetch(struct thread_data *td);
 extern int iolog_compress_init(struct thread_data *, struct sk_out *);
 extern void iolog_compress_exit(struct thread_data *);
 extern size_t log_chunk_sizes(struct io_log *);
 extern int init_io_u_buffers(struct thread_data *);
+extern unsigned long long delay_since_ttime(const struct thread_data *,
+					     unsigned long long);
 
 #ifdef CONFIG_ZLIB
 extern int iolog_file_inflate(const char *);
@@ -262,6 +274,7 @@ struct log_params {
 	int hist_coarseness;
 	int log_type;
 	int log_offset;
+	int log_prio;
 	int log_gz;
 	int log_gz_store;
 	int log_compress;

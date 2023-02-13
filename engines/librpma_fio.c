@@ -1,7 +1,7 @@
 /*
  * librpma_fio: librpma_apm and librpma_gpspm engines' common part.
  *
- * Copyright 2021, Intel Corporation
+ * Copyright 2021-2022, Intel Corporation
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -13,9 +13,11 @@
  * GNU General Public License for more details.
  */
 
-#include "librpma_fio.h"
-
-#include <libpmem.h>
+#ifdef CONFIG_LIBPMEM2_INSTALLED
+#include "librpma_fio_pmem2.h"
+#else
+#include "librpma_fio_pmem.h"
+#endif /* CONFIG_LIBPMEM2_INSTALLED */
 
 struct fio_option librpma_fio_options[] = {
 	{
@@ -46,6 +48,17 @@ struct fio_option librpma_fio_options[] = {
 					direct_write_to_pmem),
 		.help	= "Set to true ONLY when Direct Write to PMem from the remote host is possible (https://pmem.io/rpma/documentation/basic-direct-write-to-pmem.html)",
 		.def	= "",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_LIBRPMA,
+	},
+	{
+		.name	= "busy_wait_polling",
+		.lname	= "Set to 0 to wait for completion instead of busy-wait polling completion.",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct librpma_fio_options_values,
+					busy_wait_polling),
+		.help	= "Set to false if you want to reduce CPU usage",
+		.def	= "1",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_LIBRPMA,
 	},
@@ -97,13 +110,11 @@ char *librpma_fio_allocate_dram(struct thread_data *td, size_t size,
 	return mem_ptr;
 }
 
-char *librpma_fio_allocate_pmem(struct thread_data *td, const char *filename,
+char *librpma_fio_allocate_pmem(struct thread_data *td, struct fio_file *f,
 		size_t size, struct librpma_fio_mem *mem)
 {
-	size_t size_mmap = 0;
-	char *mem_ptr = NULL;
-	int is_pmem = 0;
 	size_t ws_offset;
+	mem->mem_ptr = NULL;
 
 	if (size % page_size) {
 		log_err("fio: size (%zu) is not aligned to page size (%zu)\n",
@@ -111,55 +122,37 @@ char *librpma_fio_allocate_pmem(struct thread_data *td, const char *filename,
 		return NULL;
 	}
 
-	ws_offset = (td->thread_number - 1) * size;
+	if (f->filetype == FIO_TYPE_CHAR) {
+		/* Each thread uses a separate offset within DeviceDAX. */
+		ws_offset = (td->thread_number - 1) * size;
+	} else {
+		/* Each thread uses a separate FileSystemDAX file. No offset is needed. */
+		ws_offset = 0;
+	}
 
-	if (!filename) {
+	if (!f->file_name) {
 		log_err("fio: filename is not set\n");
 		return NULL;
 	}
 
-	/* map the file */
-	mem_ptr = pmem_map_file(filename, 0 /* len */, 0 /* flags */,
-			0 /* mode */, &size_mmap, &is_pmem);
-	if (mem_ptr == NULL) {
-		log_err("fio: pmem_map_file(%s) failed\n", filename);
-		/* pmem_map_file() sets errno on failure */
-		td_verror(td, errno, "pmem_map_file");
+	if (librpma_fio_pmem_map_file(f, size, mem, ws_offset)) {
+		log_err("fio: librpma_fio_pmem_map_file(%s) failed\n",
+			f->file_name);
 		return NULL;
 	}
 
-	/* pmem is expected */
-	if (!is_pmem) {
-		log_err("fio: %s is not located in persistent memory\n",
-			filename);
-		goto err_unmap;
-	}
-
-	/* check size of allocated persistent memory */
-	if (size_mmap < ws_offset + size) {
-		log_err(
-			"fio: %s is too small to handle so many threads (%zu < %zu)\n",
-			filename, size_mmap, ws_offset + size);
-		goto err_unmap;
-	}
-
 	log_info("fio: size of memory mapped from the file %s: %zu\n",
-		filename, size_mmap);
+		f->file_name, mem->size_mmap);
 
-	mem->mem_ptr = mem_ptr;
-	mem->size_mmap = size_mmap;
+	log_info("fio: library used to map PMem from file: %s\n", RPMA_PMEM_USED);
 
-	return mem_ptr + ws_offset;
-
-err_unmap:
-	(void) pmem_unmap(mem_ptr, size_mmap);
-	return NULL;
+	return mem->mem_ptr ? mem->mem_ptr + ws_offset : NULL;
 }
 
 void librpma_fio_free(struct librpma_fio_mem *mem)
 {
 	if (mem->size_mmap)
-		(void) pmem_unmap(mem->mem_ptr, mem->size_mmap);
+		librpma_fio_unmap(mem);
 	else
 		free(mem->mem_ptr);
 }
@@ -285,6 +278,12 @@ int librpma_fio_client_init(struct thread_data *td,
 	if (ccd->conn == NULL)
 		goto err_peer_delete;
 
+	/* get the connection's main CQ */
+	if ((ret = rpma_conn_get_cq(ccd->conn, &ccd->cq))) {
+		librpma_td_verror(td, ret, "rpma_conn_get_cq");
+		goto err_conn_delete;
+	}
+
 	/* get the connection's private data sent from the server */
 	if ((ret = rpma_conn_get_private_data(ccd->conn, &pdata))) {
 		librpma_td_verror(td, ret, "rpma_conn_get_private_data");
@@ -403,7 +402,7 @@ int librpma_fio_client_post_init(struct thread_data *td)
 
 	/*
 	 * td->orig_buffer is not aligned. The engine requires aligned io_us
-	 * so FIO alignes up the address using the formula below.
+	 * so FIO aligns up the address using the formula below.
 	 */
 	ccd->orig_buffer_aligned = PTR_ALIGN(td->orig_buffer, page_mask) +
 			td->o.mem_align;
@@ -438,7 +437,7 @@ static enum fio_q_status client_queue_sync(struct thread_data *td,
 		struct io_u *io_u)
 {
 	struct librpma_fio_client_data *ccd = td->io_ops_data;
-	struct rpma_completion cmpl;
+	struct ibv_wc wc;
 	unsigned io_u_index;
 	int ret;
 
@@ -461,31 +460,31 @@ static enum fio_q_status client_queue_sync(struct thread_data *td,
 
 	do {
 		/* get a completion */
-		ret = rpma_conn_completion_get(ccd->conn, &cmpl);
+		ret = rpma_cq_get_wc(ccd->cq, 1, &wc, NULL);
 		if (ret == RPMA_E_NO_COMPLETION) {
 			/* lack of completion is not an error */
 			continue;
 		} else if (ret != 0) {
 			/* an error occurred */
-			librpma_td_verror(td, ret, "rpma_conn_completion_get");
+			librpma_td_verror(td, ret, "rpma_cq_get_wc");
 			goto err;
 		}
 
 		/* if io_us has completed with an error */
-		if (cmpl.op_status != IBV_WC_SUCCESS)
+		if (wc.status != IBV_WC_SUCCESS)
 			goto err;
 
-		if (cmpl.op == RPMA_OP_SEND)
+		if (wc.opcode == IBV_WC_SEND)
 			++ccd->op_send_completed;
 		else {
-			if (cmpl.op == RPMA_OP_RECV)
+			if (wc.opcode == IBV_WC_RECV)
 				++ccd->op_recv_completed;
 
 			break;
 		}
 	} while (1);
 
-	if (ccd->get_io_u_index(&cmpl, &io_u_index) != 1)
+	if (ccd->get_io_u_index(&wc, &io_u_index) != 1)
 		goto err;
 
 	if (io_u->index != io_u_index) {
@@ -598,9 +597,16 @@ int librpma_fio_client_commit(struct thread_data *td)
 		}
 	}
 
-	if ((fill_time = fio_fill_issue_time(td)))
+	if ((fill_time = fio_fill_issue_time(td))) {
 		fio_gettime(&now, NULL);
 
+		/*
+		 * only used for iolog
+		 */
+		if (td->o.read_iolog_file)
+			memcpy(&td->last_issue, &now, sizeof(now));
+
+	}
 	/* move executed io_us from queued[] to flight[] */
 	for (i = 0; i < ccd->io_u_queued_nr; i++) {
 		struct io_u *io_u = ccd->io_us_queued[i];
@@ -637,8 +643,8 @@ int librpma_fio_client_commit(struct thread_data *td)
 static int client_getevent_process(struct thread_data *td)
 {
 	struct librpma_fio_client_data *ccd = td->io_ops_data;
-	struct rpma_completion cmpl;
-	/* io_u->index of completed io_u (cmpl.op_context) */
+	struct ibv_wc wc;
+	/* io_u->index of completed io_u (wc.wr_id) */
 	unsigned int io_u_index;
 	/* # of completed io_us */
 	int cmpl_num = 0;
@@ -648,7 +654,7 @@ static int client_getevent_process(struct thread_data *td)
 	int ret;
 
 	/* get a completion */
-	if ((ret = rpma_conn_completion_get(ccd->conn, &cmpl))) {
+	if ((ret = rpma_cq_get_wc(ccd->cq, 1, &wc, NULL))) {
 		/* lack of completion is not an error */
 		if (ret == RPMA_E_NO_COMPLETION) {
 			/* lack of completion is not an error */
@@ -656,22 +662,22 @@ static int client_getevent_process(struct thread_data *td)
 		}
 
 		/* an error occurred */
-		librpma_td_verror(td, ret, "rpma_conn_completion_get");
+		librpma_td_verror(td, ret, "rpma_cq_get_wc");
 		return -1;
 	}
 
 	/* if io_us has completed with an error */
-	if (cmpl.op_status != IBV_WC_SUCCESS) {
-		td->error = cmpl.op_status;
+	if (wc.status != IBV_WC_SUCCESS) {
+		td->error = wc.status;
 		return -1;
 	}
 
-	if (cmpl.op == RPMA_OP_SEND)
+	if (wc.opcode == IBV_WC_SEND)
 		++ccd->op_send_completed;
-	else if (cmpl.op == RPMA_OP_RECV)
+	else if (wc.opcode == IBV_WC_RECV)
 		++ccd->op_recv_completed;
 
-	if ((ret = ccd->get_io_u_index(&cmpl, &io_u_index)) != 1)
+	if ((ret = ccd->get_io_u_index(&wc, &io_u_index)) != 1)
 		return ret;
 
 	/* look for an io_u being completed */
@@ -733,7 +739,7 @@ int librpma_fio_client_getevents(struct thread_data *td, unsigned int min,
 
 			/*
 			 * To reduce CPU consumption one can use
-			 * the rpma_conn_completion_wait() function.
+			 * the rpma_cq_wait() function.
 			 * Note this greatly increase the latency
 			 * and make the results less stable.
 			 * The bandwidth stays more or less the same.
@@ -882,6 +888,7 @@ int librpma_fio_server_open_file(struct thread_data *td, struct fio_file *f,
 	size_t mem_size = td->o.size;
 	size_t mr_desc_size;
 	void *ws_ptr;
+	bool is_dram;
 	int usage_mem_type;
 	int ret;
 
@@ -899,14 +906,14 @@ int librpma_fio_server_open_file(struct thread_data *td, struct fio_file *f,
 		return -1;
 	}
 
-	if (strcmp(f->file_name, "malloc") == 0) {
+	is_dram = !strcmp(f->file_name, "malloc");
+	if (is_dram) {
 		/* allocation from DRAM using posix_memalign() */
 		ws_ptr = librpma_fio_allocate_dram(td, mem_size, &csd->mem);
 		usage_mem_type = RPMA_MR_USAGE_FLUSH_TYPE_VISIBILITY;
 	} else {
 		/* allocation from PMEM using pmem_map_file() */
-		ws_ptr = librpma_fio_allocate_pmem(td, f->file_name,
-				mem_size, &csd->mem);
+		ws_ptr = librpma_fio_allocate_pmem(td, f, mem_size, &csd->mem);
 		usage_mem_type = RPMA_MR_USAGE_FLUSH_TYPE_PERSISTENT;
 	}
 
@@ -921,6 +928,21 @@ int librpma_fio_server_open_file(struct thread_data *td, struct fio_file *f,
 			usage_mem_type, &mr))) {
 		librpma_td_verror(td, ret, "rpma_mr_reg");
 		goto err_free;
+	}
+
+	if (!is_dram && f->filetype == FIO_TYPE_FILE) {
+		ret = rpma_mr_advise(mr, 0, mem_size,
+				IBV_ADVISE_MR_ADVICE_PREFETCH_WRITE,
+				IBV_ADVISE_MR_FLAG_FLUSH);
+		if (ret) {
+			librpma_td_verror(td, ret, "rpma_mr_advise");
+			/* an invalid argument is an error */
+			if (ret == RPMA_E_INVAL)
+				goto err_mr_dereg;
+
+			/* log_err used instead of log_info to avoid corruption of the JSON output */
+			log_err("Note: having rpma_mr_advise(3) failed because of RPMA_E_NOSUPP or RPMA_E_PROVIDER may come with a performance penalty, but it is not a blocker for running the benchmark.\n");
+		}
 	}
 
 	/* get size of the memory region's descriptor */
@@ -995,6 +1017,12 @@ int librpma_fio_server_open_file(struct thread_data *td, struct fio_file *f,
 	csd->ws_mr = mr;
 	csd->ws_ptr = ws_ptr;
 	csd->conn = conn;
+
+	/* get the connection's main CQ */
+	if ((ret = rpma_conn_get_cq(csd->conn, &csd->cq))) {
+		librpma_td_verror(td, ret, "rpma_conn_get_cq");
+		goto err_conn_delete;
+	}
 
 	return 0;
 

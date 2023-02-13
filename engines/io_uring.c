@@ -23,6 +23,14 @@
 
 #include "../lib/types.h"
 #include "../os/linux/io_uring.h"
+#include "cmdprio.h"
+#include "nvme.h"
+
+#include <sys/stat.h>
+
+enum uring_cmd_type {
+	FIO_URING_CMD_NVME = 1,
+};
 
 struct io_sq_ring {
 	unsigned *head;
@@ -64,17 +72,17 @@ struct ioring_data {
 	int queued;
 	int cq_ring_off;
 	unsigned iodepth;
-	bool ioprio_class_set;
-	bool ioprio_set;
 	int prepped;
 
 	struct ioring_mmap mmap[3];
+
+	struct cmdprio cmdprio;
 };
 
 struct ioring_options {
-	void *pad;
+	struct thread_data *td;
 	unsigned int hipri;
-	unsigned int cmdprio_percentage;
+	struct cmdprio_options cmdprio_options;
 	unsigned int fixedbufs;
 	unsigned int registerfiles;
 	unsigned int sqpoll_thread;
@@ -84,6 +92,7 @@ struct ioring_options {
 	unsigned int uncached;
 	unsigned int nowait;
 	unsigned int force_async;
+	enum uring_cmd_type cmd_type;
 };
 
 static const int ddir_to_op[2][2] = {
@@ -120,10 +129,53 @@ static struct fio_option options[] = {
 		.name	= "cmdprio_percentage",
 		.lname	= "high priority percentage",
 		.type	= FIO_OPT_INT,
-		.off1	= offsetof(struct ioring_options, cmdprio_percentage),
-		.minval	= 1,
+		.off1	= offsetof(struct ioring_options,
+				   cmdprio_options.percentage[DDIR_READ]),
+		.off2	= offsetof(struct ioring_options,
+				   cmdprio_options.percentage[DDIR_WRITE]),
+		.minval	= 0,
 		.maxval	= 100,
 		.help	= "Send high priority I/O this percentage of the time",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_IOURING,
+	},
+	{
+		.name	= "cmdprio_class",
+		.lname	= "Asynchronous I/O priority class",
+		.type	= FIO_OPT_INT,
+		.off1	= offsetof(struct ioring_options,
+				   cmdprio_options.class[DDIR_READ]),
+		.off2	= offsetof(struct ioring_options,
+				   cmdprio_options.class[DDIR_WRITE]),
+		.help	= "Set asynchronous IO priority class",
+		.minval	= IOPRIO_MIN_PRIO_CLASS + 1,
+		.maxval	= IOPRIO_MAX_PRIO_CLASS,
+		.interval = 1,
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_IOURING,
+	},
+	{
+		.name	= "cmdprio",
+		.lname	= "Asynchronous I/O priority level",
+		.type	= FIO_OPT_INT,
+		.off1	= offsetof(struct ioring_options,
+				   cmdprio_options.level[DDIR_READ]),
+		.off2	= offsetof(struct ioring_options,
+				   cmdprio_options.level[DDIR_WRITE]),
+		.help	= "Set asynchronous IO priority level",
+		.minval	= IOPRIO_MIN_PRIO,
+		.maxval	= IOPRIO_MAX_PRIO,
+		.interval = 1,
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_IOURING,
+	},
+	{
+		.name   = "cmdprio_bssplit",
+		.lname  = "Priority percentage block size split",
+		.type   = FIO_OPT_STR_STORE,
+		.off1   = offsetof(struct ioring_options,
+				   cmdprio_options.bssplit_str),
+		.help   = "Set priority percentages for different block sizes",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_IOURING,
 	},
@@ -131,6 +183,24 @@ static struct fio_option options[] = {
 	{
 		.name	= "cmdprio_percentage",
 		.lname	= "high priority percentage",
+		.type	= FIO_OPT_UNSUPPORTED,
+		.help	= "Your platform does not support I/O priority classes",
+	},
+	{
+		.name	= "cmdprio_class",
+		.lname	= "Asynchronous I/O priority class",
+		.type	= FIO_OPT_UNSUPPORTED,
+		.help	= "Your platform does not support I/O priority classes",
+	},
+	{
+		.name	= "cmdprio",
+		.lname	= "Asynchronous I/O priority level",
+		.type	= FIO_OPT_UNSUPPORTED,
+		.help	= "Your platform does not support I/O priority classes",
+	},
+	{
+		.name   = "cmdprio_bssplit",
+		.lname  = "Priority percentage block size split",
 		.type	= FIO_OPT_UNSUPPORTED,
 		.help	= "Your platform does not support I/O priority classes",
 	},
@@ -156,7 +226,7 @@ static struct fio_option options[] = {
 	{
 		.name	= "sqthread_poll",
 		.lname	= "Kernel SQ thread polling",
-		.type	= FIO_OPT_INT,
+		.type	= FIO_OPT_STR_SET,
 		.off1	= offsetof(struct ioring_options, sqpoll_thread),
 		.help	= "Offload submission/completion to kernel thread",
 		.category = FIO_OPT_C_ENGINE,
@@ -209,6 +279,22 @@ static struct fio_option options[] = {
 		.group	= FIO_OPT_G_IOURING,
 	},
 	{
+		.name	= "cmd_type",
+		.lname	= "Uring cmd type",
+		.type	= FIO_OPT_STR,
+		.off1	= offsetof(struct ioring_options, cmd_type),
+		.help	= "Specify uring-cmd type",
+		.def	= "nvme",
+		.posval = {
+			  { .ival = "nvme",
+			    .oval = FIO_URING_CMD_NVME,
+			    .help = "Issue nvme-uring-cmd",
+			  },
+		},
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_IOURING,
+	},
+	{
 		.name	= NULL,
 	},
 };
@@ -216,8 +302,13 @@ static struct fio_option options[] = {
 static int io_uring_enter(struct ioring_data *ld, unsigned int to_submit,
 			 unsigned int min_complete, unsigned int flags)
 {
+#ifdef FIO_ARCH_HAS_SYSCALL
+	return __do_syscall6(__NR_io_uring_enter, ld->ring_fd, to_submit,
+				min_complete, flags, NULL, 0);
+#else
 	return syscall(__NR_io_uring_enter, ld->ring_fd, to_submit,
 			min_complete, flags, NULL, 0);
+#endif
 }
 
 static int fio_ioring_prep(struct thread_data *td, struct io_u *io_u)
@@ -234,6 +325,7 @@ static int fio_ioring_prep(struct thread_data *td, struct io_u *io_u)
 		sqe->flags = IOSQE_FIXED_FILE;
 	} else {
 		sqe->fd = f->fd;
+		sqe->flags = 0;
 	}
 
 	if (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_WRITE) {
@@ -261,16 +353,24 @@ static int fio_ioring_prep(struct thread_data *td, struct io_u *io_u)
 				sqe->len = 1;
 			}
 		}
+		sqe->rw_flags = 0;
 		if (!td->o.odirect && o->uncached)
-			sqe->rw_flags = RWF_UNCACHED;
+			sqe->rw_flags |= RWF_UNCACHED;
 		if (o->nowait)
 			sqe->rw_flags |= RWF_NOWAIT;
-		if (ld->ioprio_class_set)
-			sqe->ioprio = td->o.ioprio_class << 13;
-		if (ld->ioprio_set)
-			sqe->ioprio |= td->o.ioprio;
+
+		/*
+		 * Since io_uring can have a submission context (sqthread_poll)
+		 * that is different from the process context, we cannot rely on
+		 * the IO priority set by ioprio_set() (option prio/prioclass)
+		 * to be inherited.
+		 * td->ioprio will have the value of the "default prio", so set
+		 * this unconditionally. This value might get overridden by
+		 * fio_ioring_cmdprio_prep() if the option cmdprio_percentage or
+		 * cmdprio_bssplit is used.
+		 */
+		sqe->ioprio = td->ioprio;
 		sqe->off = io_u->offset;
-		sqe->rw_flags = 0;
 	} else if (ddir_sync(io_u->ddir)) {
 		sqe->ioprio = 0;
 		if (io_u->ddir == DDIR_SYNC_FILE_RANGE) {
@@ -297,6 +397,52 @@ static int fio_ioring_prep(struct thread_data *td, struct io_u *io_u)
 	return 0;
 }
 
+static int fio_ioring_cmd_prep(struct thread_data *td, struct io_u *io_u)
+{
+	struct ioring_data *ld = td->io_ops_data;
+	struct ioring_options *o = td->eo;
+	struct fio_file *f = io_u->file;
+	struct nvme_uring_cmd *cmd;
+	struct io_uring_sqe *sqe;
+
+	/* only supports nvme_uring_cmd */
+	if (o->cmd_type != FIO_URING_CMD_NVME)
+		return -EINVAL;
+
+	sqe = &ld->sqes[(io_u->index) << 1];
+
+	if (o->registerfiles) {
+		sqe->fd = f->engine_pos;
+		sqe->flags = IOSQE_FIXED_FILE;
+	} else {
+		sqe->fd = f->fd;
+	}
+	sqe->rw_flags = 0;
+	if (!td->o.odirect && o->uncached)
+		sqe->rw_flags |= RWF_UNCACHED;
+	if (o->nowait)
+		sqe->rw_flags |= RWF_NOWAIT;
+
+	sqe->opcode = IORING_OP_URING_CMD;
+	sqe->user_data = (unsigned long) io_u;
+	if (o->nonvectored)
+		sqe->cmd_op = NVME_URING_CMD_IO;
+	else
+		sqe->cmd_op = NVME_URING_CMD_IO_VEC;
+	if (o->force_async && ++ld->prepped == o->force_async) {
+		ld->prepped = 0;
+		sqe->flags |= IOSQE_ASYNC;
+	}
+	if (o->fixedbufs) {
+		sqe->uring_cmd_flags = IORING_URING_CMD_FIXED;
+		sqe->buf_index = io_u->index;
+	}
+
+	cmd = (struct nvme_uring_cmd *)sqe->cmd;
+	return fio_nvme_uring_cmd_prep(cmd, io_u,
+			o->nonvectored ? NULL : &ld->iovecs[io_u->index]);
+}
+
 static struct io_u *fio_ioring_event(struct thread_data *td, int event)
 {
 	struct ioring_data *ld = td->io_ops_data;
@@ -315,6 +461,29 @@ static struct io_u *fio_ioring_event(struct thread_data *td, int event)
 		else
 			io_u->resid = io_u->xfer_buflen - cqe->res;
 	} else
+		io_u->error = 0;
+
+	return io_u;
+}
+
+static struct io_u *fio_ioring_cmd_event(struct thread_data *td, int event)
+{
+	struct ioring_data *ld = td->io_ops_data;
+	struct ioring_options *o = td->eo;
+	struct io_uring_cqe *cqe;
+	struct io_u *io_u;
+	unsigned index;
+
+	index = (event + ld->cq_ring_off) & ld->cq_ring_mask;
+	if (o->cmd_type == FIO_URING_CMD_NVME)
+		index <<= 1;
+
+	cqe = &ld->cq_ring.cqes[index];
+	io_u = (struct io_u *) (uintptr_t) cqe->user_data;
+
+	if (cqe->res != 0)
+		io_u->error = -cqe->res;
+	else
 		io_u->error = 0;
 
 	return io_u;
@@ -367,6 +536,7 @@ static int fio_ioring_getevents(struct thread_data *td, unsigned int min,
 			if (r < 0) {
 				if (errno == EAGAIN || errno == EINTR)
 					continue;
+				r = -errno;
 				td_verror(td, errno, "io_uring_enter");
 				break;
 			}
@@ -376,15 +546,14 @@ static int fio_ioring_getevents(struct thread_data *td, unsigned int min,
 	return r < 0 ? r : events;
 }
 
-static void fio_ioring_prio_prep(struct thread_data *td, struct io_u *io_u)
+static inline void fio_ioring_cmdprio_prep(struct thread_data *td,
+					   struct io_u *io_u)
 {
-	struct ioring_options *o = td->eo;
 	struct ioring_data *ld = td->io_ops_data;
-	if (rand_between(&td->prio_state, 0, 99) < o->cmdprio_percentage) {
-		ld->sqes[io_u->index].ioprio = IOPRIO_CLASS_RT << IOPRIO_CLASS_SHIFT;
-		io_u->flags |= IO_U_F_PRIORITY;
-	}
-	return;
+	struct cmdprio *cmdprio = &ld->cmdprio;
+
+	if (fio_cmdprio_set_ioprio(td, cmdprio, io_u))
+		ld->sqes[io_u->index].ioprio = io_u->ioprio;
 }
 
 static enum fio_q_status fio_ioring_queue(struct thread_data *td,
@@ -392,7 +561,6 @@ static enum fio_q_status fio_ioring_queue(struct thread_data *td,
 {
 	struct ioring_data *ld = td->io_ops_data;
 	struct io_sq_ring *ring = &ld->sq_ring;
-	struct ioring_options *o = td->eo;
 	unsigned tail, next_tail;
 
 	fio_ro_check(td, io_u);
@@ -415,8 +583,9 @@ static enum fio_q_status fio_ioring_queue(struct thread_data *td,
 	if (next_tail == atomic_load_acquire(ring->head))
 		return FIO_Q_BUSY;
 
-	if (o->cmdprio_percentage)
-		fio_ioring_prio_prep(td, io_u);
+	if (ld->cmdprio.mode != CMDPRIO_MODE_NONE)
+		fio_ioring_cmdprio_prep(td, io_u);
+
 	ring->array[tail & ld->sq_ring_mask] = io_u->index;
 	atomic_store_release(ring->tail, next_tail);
 
@@ -444,6 +613,12 @@ static void fio_ioring_queued(struct thread_data *td, int start, int nr)
 
 		start++;
 	}
+
+	/*
+	 * only used for iolog
+	 */
+	if (td->o.read_iolog_file)
+		memcpy(&td->last_issue, &now, sizeof(now));
 }
 
 static int fio_ioring_commit(struct thread_data *td)
@@ -462,12 +637,16 @@ static int fio_ioring_commit(struct thread_data *td)
 	 */
 	if (o->sqpoll_thread) {
 		struct io_sq_ring *ring = &ld->sq_ring;
+		unsigned start = *ld->sq_ring.head;
 		unsigned flags;
 
 		flags = atomic_load_acquire(ring->flags);
 		if (flags & IORING_SQ_NEED_WAKEUP)
 			io_uring_enter(ld, ld->queued, 0,
 					IORING_ENTER_SQ_WAKEUP);
+		fio_ioring_queued(td, start, ld->queued);
+		io_u_mark_submit(td, ld->queued);
+
 		ld->queued = 0;
 		return 0;
 	}
@@ -495,6 +674,7 @@ static int fio_ioring_commit(struct thread_data *td)
 				usleep(1);
 				continue;
 			}
+			ret = -errno;
 			td_verror(td, errno, "io_uring_enter submit");
 			break;
 		}
@@ -520,6 +700,7 @@ static void fio_ioring_cleanup(struct thread_data *td)
 		if (!(td->flags & TD_F_CHILD))
 			fio_ioring_unmap(ld);
 
+		fio_cmdprio_cleanup(&ld->cmdprio);
 		free(ld->io_u_index);
 		free(ld->iovecs);
 		free(ld->fds);
@@ -546,14 +727,22 @@ static int fio_ioring_mmap(struct ioring_data *ld, struct io_uring_params *p)
 	sring->array = ptr + p->sq_off.array;
 	ld->sq_ring_mask = *sring->ring_mask;
 
-	ld->mmap[1].len = p->sq_entries * sizeof(struct io_uring_sqe);
+	if (p->flags & IORING_SETUP_SQE128)
+		ld->mmap[1].len = 2 * p->sq_entries * sizeof(struct io_uring_sqe);
+	else
+		ld->mmap[1].len = p->sq_entries * sizeof(struct io_uring_sqe);
 	ld->sqes = mmap(0, ld->mmap[1].len, PROT_READ | PROT_WRITE,
 				MAP_SHARED | MAP_POPULATE, ld->ring_fd,
 				IORING_OFF_SQES);
 	ld->mmap[1].ptr = ld->sqes;
 
-	ld->mmap[2].len = p->cq_off.cqes +
-				p->cq_entries * sizeof(struct io_uring_cqe);
+	if (p->flags & IORING_SETUP_CQE32) {
+		ld->mmap[2].len = p->cq_off.cqes +
+					2 * p->cq_entries * sizeof(struct io_uring_cqe);
+	} else {
+		ld->mmap[2].len = p->cq_off.cqes +
+					p->cq_entries * sizeof(struct io_uring_cqe);
+	}
 	ptr = mmap(0, ld->mmap[2].len, PROT_READ | PROT_WRITE,
 			MAP_SHARED | MAP_POPULATE, ld->ring_fd,
 			IORING_OFF_CQ_RING);
@@ -619,11 +808,137 @@ static int fio_ioring_queue_init(struct thread_data *td)
 			p.flags |= IORING_SETUP_SQ_AFF;
 			p.sq_thread_cpu = o->sqpoll_cpu;
 		}
+
+		/*
+		 * Submission latency for sqpoll_thread is just the time it
+		 * takes to fill in the SQ ring entries, and any syscall if
+		 * IORING_SQ_NEED_WAKEUP is set, we don't need to log that time
+		 * separately.
+		 */
+		td->o.disable_slat = 1;
 	}
 
+	/*
+	 * Clamp CQ ring size at our SQ ring size, we don't need more entries
+	 * than that.
+	 */
+	p.flags |= IORING_SETUP_CQSIZE;
+	p.cq_entries = depth;
+
+	/*
+	 * Setup COOP_TASKRUN as we don't need to get IPI interrupted for
+	 * completing IO operations.
+	 */
+	p.flags |= IORING_SETUP_COOP_TASKRUN;
+
+	/*
+	 * io_uring is always a single issuer, and we can defer task_work
+	 * runs until we reap events.
+	 */
+	p.flags |= IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+
+retry:
 	ret = syscall(__NR_io_uring_setup, depth, &p);
-	if (ret < 0)
+	if (ret < 0) {
+		if (errno == EINVAL && p.flags & IORING_SETUP_DEFER_TASKRUN) {
+			p.flags &= ~IORING_SETUP_DEFER_TASKRUN;
+			p.flags &= ~IORING_SETUP_SINGLE_ISSUER;
+			goto retry;
+		}
+		if (errno == EINVAL && p.flags & IORING_SETUP_COOP_TASKRUN) {
+			p.flags &= ~IORING_SETUP_COOP_TASKRUN;
+			goto retry;
+		}
+		if (errno == EINVAL && p.flags & IORING_SETUP_CQSIZE) {
+			p.flags &= ~IORING_SETUP_CQSIZE;
+			goto retry;
+		}
 		return ret;
+	}
+
+	ld->ring_fd = ret;
+
+	fio_ioring_probe(td);
+
+	if (o->fixedbufs) {
+		ret = syscall(__NR_io_uring_register, ld->ring_fd,
+				IORING_REGISTER_BUFFERS, ld->iovecs, depth);
+		if (ret < 0)
+			return ret;
+	}
+
+	return fio_ioring_mmap(ld, &p);
+}
+
+static int fio_ioring_cmd_queue_init(struct thread_data *td)
+{
+	struct ioring_data *ld = td->io_ops_data;
+	struct ioring_options *o = td->eo;
+	int depth = td->o.iodepth;
+	struct io_uring_params p;
+	int ret;
+
+	memset(&p, 0, sizeof(p));
+
+	if (o->hipri)
+		p.flags |= IORING_SETUP_IOPOLL;
+	if (o->sqpoll_thread) {
+		p.flags |= IORING_SETUP_SQPOLL;
+		if (o->sqpoll_set) {
+			p.flags |= IORING_SETUP_SQ_AFF;
+			p.sq_thread_cpu = o->sqpoll_cpu;
+		}
+
+		/*
+		 * Submission latency for sqpoll_thread is just the time it
+		 * takes to fill in the SQ ring entries, and any syscall if
+		 * IORING_SQ_NEED_WAKEUP is set, we don't need to log that time
+		 * separately.
+		 */
+		td->o.disable_slat = 1;
+	}
+	if (o->cmd_type == FIO_URING_CMD_NVME) {
+		p.flags |= IORING_SETUP_SQE128;
+		p.flags |= IORING_SETUP_CQE32;
+	}
+
+	/*
+	 * Clamp CQ ring size at our SQ ring size, we don't need more entries
+	 * than that.
+	 */
+	p.flags |= IORING_SETUP_CQSIZE;
+	p.cq_entries = depth;
+
+	/*
+	 * Setup COOP_TASKRUN as we don't need to get IPI interrupted for
+	 * completing IO operations.
+	 */
+	p.flags |= IORING_SETUP_COOP_TASKRUN;
+
+	/*
+	 * io_uring is always a single issuer, and we can defer task_work
+	 * runs until we reap events.
+	 */
+	p.flags |= IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+
+retry:
+	ret = syscall(__NR_io_uring_setup, depth, &p);
+	if (ret < 0) {
+		if (errno == EINVAL && p.flags & IORING_SETUP_DEFER_TASKRUN) {
+			p.flags &= ~IORING_SETUP_DEFER_TASKRUN;
+			p.flags &= ~IORING_SETUP_SINGLE_ISSUER;
+			goto retry;
+		}
+		if (errno == EINVAL && p.flags & IORING_SETUP_COOP_TASKRUN) {
+			p.flags &= ~IORING_SETUP_COOP_TASKRUN;
+			goto retry;
+		}
+		if (errno == EINVAL && p.flags & IORING_SETUP_CQSIZE) {
+			p.flags &= ~IORING_SETUP_CQSIZE;
+			goto retry;
+		}
+		return ret;
+	}
 
 	ld->ring_fd = ret;
 
@@ -722,17 +1037,57 @@ static int fio_ioring_post_init(struct thread_data *td)
 	return 0;
 }
 
+static int fio_ioring_cmd_post_init(struct thread_data *td)
+{
+	struct ioring_data *ld = td->io_ops_data;
+	struct ioring_options *o = td->eo;
+	struct io_u *io_u;
+	int err, i;
+
+	for (i = 0; i < td->o.iodepth; i++) {
+		struct iovec *iov = &ld->iovecs[i];
+
+		io_u = ld->io_u_index[i];
+		iov->iov_base = io_u->buf;
+		iov->iov_len = td_max_bs(td);
+	}
+
+	err = fio_ioring_cmd_queue_init(td);
+	if (err) {
+		int init_err = errno;
+
+		td_verror(td, init_err, "io_queue_init");
+		return 1;
+	}
+
+	for (i = 0; i < td->o.iodepth; i++) {
+		struct io_uring_sqe *sqe;
+
+		if (o->cmd_type == FIO_URING_CMD_NVME) {
+			sqe = &ld->sqes[i << 1];
+			memset(sqe, 0, 2 * sizeof(*sqe));
+		} else {
+			sqe = &ld->sqes[i];
+			memset(sqe, 0, sizeof(*sqe));
+		}
+	}
+
+	if (o->registerfiles) {
+		err = fio_ioring_register_files(td);
+		if (err) {
+			td_verror(td, errno, "ioring_register_files");
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 static int fio_ioring_init(struct thread_data *td)
 {
 	struct ioring_options *o = td->eo;
 	struct ioring_data *ld;
-	struct thread_options *to = &td->o;
-
-	if (to->io_submit_mode == IO_MODE_OFFLOAD) {
-		log_err("fio: io_submit_mode=offload is not compatible (or "
-			"useful) with io_uring\n");
-		return 1;
-	}
+	int ret;
 
 	/* sqthread submission requires registered files */
 	if (o->sqpoll_thread)
@@ -756,21 +1111,11 @@ static int fio_ioring_init(struct thread_data *td)
 
 	td->io_ops_data = ld;
 
-	/*
-	 * Check for option conflicts
-	 */
-	if ((fio_option_is_set(to, ioprio) || fio_option_is_set(to, ioprio_class)) &&
-			o->cmdprio_percentage != 0) {
-		log_err("%s: cmdprio_percentage option and mutually exclusive "
-				"prio or prioclass option is set, exiting\n", to->name);
-		td_verror(td, EINVAL, "fio_io_uring_init");
+	ret = fio_cmdprio_init(td, &ld->cmdprio, &o->cmdprio_options);
+	if (ret) {
+		td_verror(td, EINVAL, "fio_ioring_init");
 		return 1;
 	}
-
-	if (fio_option_is_set(&td->o, ioprio_class))
-		ld->ioprio_class_set = true;
-	if (fio_option_is_set(&td->o, ioprio))
-		ld->ioprio_set = true;
 
 	return 0;
 }
@@ -795,6 +1140,38 @@ static int fio_ioring_open_file(struct thread_data *td, struct fio_file *f)
 	return 0;
 }
 
+static int fio_ioring_cmd_open_file(struct thread_data *td, struct fio_file *f)
+{
+	struct ioring_data *ld = td->io_ops_data;
+	struct ioring_options *o = td->eo;
+
+	if (o->cmd_type == FIO_URING_CMD_NVME) {
+		struct nvme_data *data = NULL;
+		unsigned int nsid, lba_size = 0;
+		unsigned long long nlba = 0;
+		int ret;
+
+		/* Store the namespace-id and lba size. */
+		data = FILE_ENG_DATA(f);
+		if (data == NULL) {
+			ret = fio_nvme_get_info(f, &nsid, &lba_size, &nlba);
+			if (ret)
+				return ret;
+
+			data = calloc(1, sizeof(struct nvme_data));
+			data->nsid = nsid;
+			data->lba_shift = ilog2(lba_size);
+
+			FILE_SET_ENG_DATA(f, data);
+		}
+	}
+	if (!ld || !o->registerfiles)
+		return generic_open_file(td, f);
+
+	f->fd = ld->fds[f->engine_pos];
+	return 0;
+}
+
 static int fio_ioring_close_file(struct thread_data *td, struct fio_file *f)
 {
 	struct ioring_data *ld = td->io_ops_data;
@@ -807,10 +1184,89 @@ static int fio_ioring_close_file(struct thread_data *td, struct fio_file *f)
 	return 0;
 }
 
-static struct ioengine_ops ioengine = {
+static int fio_ioring_cmd_close_file(struct thread_data *td,
+				     struct fio_file *f)
+{
+	struct ioring_data *ld = td->io_ops_data;
+	struct ioring_options *o = td->eo;
+
+	if (o->cmd_type == FIO_URING_CMD_NVME) {
+		struct nvme_data *data = FILE_ENG_DATA(f);
+
+		FILE_SET_ENG_DATA(f, NULL);
+		free(data);
+	}
+	if (!ld || !o->registerfiles)
+		return generic_close_file(td, f);
+
+	f->fd = -1;
+	return 0;
+}
+
+static int fio_ioring_cmd_get_file_size(struct thread_data *td,
+					struct fio_file *f)
+{
+	struct ioring_options *o = td->eo;
+
+	if (fio_file_size_known(f))
+		return 0;
+
+	if (o->cmd_type == FIO_URING_CMD_NVME) {
+		struct nvme_data *data = NULL;
+		unsigned int nsid, lba_size = 0;
+		unsigned long long nlba = 0;
+		int ret;
+
+		ret = fio_nvme_get_info(f, &nsid, &lba_size, &nlba);
+		if (ret)
+			return ret;
+
+		data = calloc(1, sizeof(struct nvme_data));
+		data->nsid = nsid;
+		data->lba_shift = ilog2(lba_size);
+
+		f->real_file_size = lba_size * nlba;
+		fio_file_set_size_known(f);
+
+		FILE_SET_ENG_DATA(f, data);
+		return 0;
+	}
+	return generic_get_file_size(td, f);
+}
+
+static int fio_ioring_cmd_get_zoned_model(struct thread_data *td,
+					  struct fio_file *f,
+					  enum zbd_zoned_model *model)
+{
+	return fio_nvme_get_zoned_model(td, f, model);
+}
+
+static int fio_ioring_cmd_report_zones(struct thread_data *td,
+				       struct fio_file *f, uint64_t offset,
+				       struct zbd_zone *zbdz,
+				       unsigned int nr_zones)
+{
+	return fio_nvme_report_zones(td, f, offset, zbdz, nr_zones);
+}
+
+static int fio_ioring_cmd_reset_wp(struct thread_data *td, struct fio_file *f,
+				   uint64_t offset, uint64_t length)
+{
+	return fio_nvme_reset_wp(td, f, offset, length);
+}
+
+static int fio_ioring_cmd_get_max_open_zones(struct thread_data *td,
+					     struct fio_file *f,
+					     unsigned int *max_open_zones)
+{
+	return fio_nvme_get_max_open_zones(td, f, max_open_zones);
+}
+
+static struct ioengine_ops ioengine_uring = {
 	.name			= "io_uring",
 	.version		= FIO_IOOPS_VERSION,
-	.flags			= FIO_ASYNCIO_SYNC_TRIM | FIO_NO_OFFLOAD,
+	.flags			= FIO_ASYNCIO_SYNC_TRIM | FIO_NO_OFFLOAD |
+					FIO_ASYNCIO_SETS_ISSUE_TIME,
 	.init			= fio_ioring_init,
 	.post_init		= fio_ioring_post_init,
 	.io_u_init		= fio_ioring_io_u_init,
@@ -827,13 +1283,41 @@ static struct ioengine_ops ioengine = {
 	.option_struct_size	= sizeof(struct ioring_options),
 };
 
+static struct ioengine_ops ioengine_uring_cmd = {
+	.name			= "io_uring_cmd",
+	.version		= FIO_IOOPS_VERSION,
+	.flags			= FIO_ASYNCIO_SYNC_TRIM | FIO_NO_OFFLOAD |
+					FIO_MEMALIGN | FIO_RAWIO |
+					FIO_ASYNCIO_SETS_ISSUE_TIME,
+	.init			= fio_ioring_init,
+	.post_init		= fio_ioring_cmd_post_init,
+	.io_u_init		= fio_ioring_io_u_init,
+	.prep			= fio_ioring_cmd_prep,
+	.queue			= fio_ioring_queue,
+	.commit			= fio_ioring_commit,
+	.getevents		= fio_ioring_getevents,
+	.event			= fio_ioring_cmd_event,
+	.cleanup		= fio_ioring_cleanup,
+	.open_file		= fio_ioring_cmd_open_file,
+	.close_file		= fio_ioring_cmd_close_file,
+	.get_file_size		= fio_ioring_cmd_get_file_size,
+	.get_zoned_model	= fio_ioring_cmd_get_zoned_model,
+	.report_zones		= fio_ioring_cmd_report_zones,
+	.reset_wp		= fio_ioring_cmd_reset_wp,
+	.get_max_open_zones	= fio_ioring_cmd_get_max_open_zones,
+	.options		= options,
+	.option_struct_size	= sizeof(struct ioring_options),
+};
+
 static void fio_init fio_ioring_register(void)
 {
-	register_ioengine(&ioengine);
+	register_ioengine(&ioengine_uring);
+	register_ioengine(&ioengine_uring_cmd);
 }
 
 static void fio_exit fio_ioring_unregister(void)
 {
-	unregister_ioengine(&ioengine);
+	unregister_ioengine(&ioengine_uring);
+	unregister_ioengine(&ioengine_uring_cmd);
 }
 #endif

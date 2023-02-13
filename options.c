@@ -73,13 +73,7 @@ static int bs_cmp(const void *p1, const void *p2)
 	return (int) bsp1->perc - (int) bsp2->perc;
 }
 
-struct split {
-	unsigned int nr;
-	unsigned long long val1[ZONESPLIT_MAX];
-	unsigned long long val2[ZONESPLIT_MAX];
-};
-
-static int split_parse_ddir(struct thread_options *o, struct split *split,
+int split_parse_ddir(struct thread_options *o, struct split *split,
 			    char *str, bool absolute, unsigned int max_splits)
 {
 	unsigned long long perc;
@@ -138,8 +132,8 @@ static int split_parse_ddir(struct thread_options *o, struct split *split,
 	return 0;
 }
 
-static int bssplit_ddir(struct thread_options *o, enum fio_ddir ddir, char *str,
-			bool data)
+static int bssplit_ddir(struct thread_options *o, void *eo,
+			enum fio_ddir ddir, char *str, bool data)
 {
 	unsigned int i, perc, perc_missing;
 	unsigned long long max_bs, min_bs;
@@ -211,10 +205,8 @@ static int bssplit_ddir(struct thread_options *o, enum fio_ddir ddir, char *str,
 	return 0;
 }
 
-typedef int (split_parse_fn)(struct thread_options *, enum fio_ddir, char *, bool);
-
-static int str_split_parse(struct thread_data *td, char *str,
-			   split_parse_fn *fn, bool data)
+int str_split_parse(struct thread_data *td, char *str,
+		    split_parse_fn *fn, void *eo, bool data)
 {
 	char *odir, *ddir;
 	int ret = 0;
@@ -223,37 +215,37 @@ static int str_split_parse(struct thread_data *td, char *str,
 	if (odir) {
 		ddir = strchr(odir + 1, ',');
 		if (ddir) {
-			ret = fn(&td->o, DDIR_TRIM, ddir + 1, data);
+			ret = fn(&td->o, eo, DDIR_TRIM, ddir + 1, data);
 			if (!ret)
 				*ddir = '\0';
 		} else {
 			char *op;
 
 			op = strdup(odir + 1);
-			ret = fn(&td->o, DDIR_TRIM, op, data);
+			ret = fn(&td->o, eo, DDIR_TRIM, op, data);
 
 			free(op);
 		}
 		if (!ret)
-			ret = fn(&td->o, DDIR_WRITE, odir + 1, data);
+			ret = fn(&td->o, eo, DDIR_WRITE, odir + 1, data);
 		if (!ret) {
 			*odir = '\0';
-			ret = fn(&td->o, DDIR_READ, str, data);
+			ret = fn(&td->o, eo, DDIR_READ, str, data);
 		}
 	} else {
 		char *op;
 
 		op = strdup(str);
-		ret = fn(&td->o, DDIR_WRITE, op, data);
+		ret = fn(&td->o, eo, DDIR_WRITE, op, data);
 		free(op);
 
 		if (!ret) {
 			op = strdup(str);
-			ret = fn(&td->o, DDIR_TRIM, op, data);
+			ret = fn(&td->o, eo, DDIR_TRIM, op, data);
 			free(op);
 		}
 		if (!ret)
-			ret = fn(&td->o, DDIR_READ, str, data);
+			ret = fn(&td->o, eo, DDIR_READ, str, data);
 	}
 
 	return ret;
@@ -270,7 +262,7 @@ static int str_bssplit_cb(void *data, const char *input)
 	strip_blank_front(&str);
 	strip_blank_end(str);
 
-	ret = str_split_parse(td, str, bssplit_ddir, false);
+	ret = str_split_parse(td, str, bssplit_ddir, NULL, false);
 
 	if (parse_dryrun()) {
 		int i;
@@ -284,6 +276,128 @@ static int str_bssplit_cb(void *data, const char *input)
 
 	free(p);
 	return ret;
+}
+
+static int parse_cmdprio_bssplit_entry(struct thread_options *o,
+				       struct split_prio *entry, char *str)
+{
+	int matches = 0;
+	char *bs_str = NULL;
+	long long bs_val;
+	unsigned int perc = 0, class, level;
+
+	/*
+	 * valid entry formats:
+	 * bs/ - %s/ - set perc to 0, prio to -1.
+	 * bs/perc - %s/%u - set prio to -1.
+	 * bs/perc/class/level - %s/%u/%u/%u
+	 */
+	matches = sscanf(str, "%m[^/]/%u/%u/%u", &bs_str, &perc, &class, &level);
+	if (matches < 1) {
+		log_err("fio: invalid cmdprio_bssplit format\n");
+		return 1;
+	}
+
+	if (str_to_decimal(bs_str, &bs_val, 1, o, 0, 0)) {
+		log_err("fio: split conversion failed\n");
+		free(bs_str);
+		return 1;
+	}
+	free(bs_str);
+
+	entry->bs = bs_val;
+	entry->perc = min(perc, 100u);
+	entry->prio = -1;
+	switch (matches) {
+	case 1: /* bs/ case */
+	case 2: /* bs/perc case */
+		break;
+	case 4: /* bs/perc/class/level case */
+		class = min(class, (unsigned int) IOPRIO_MAX_PRIO_CLASS);
+		level = min(level, (unsigned int) IOPRIO_MAX_PRIO);
+		entry->prio = ioprio_value(class, level);
+		break;
+	default:
+		log_err("fio: invalid cmdprio_bssplit format\n");
+		return 1;
+	}
+
+	return 0;
+}
+
+/*
+ * Returns a negative integer if the first argument should be before the second
+ * argument in the sorted list. A positive integer if the first argument should
+ * be after the second argument in the sorted list. A zero if they are equal.
+ */
+static int fio_split_prio_cmp(const void *p1, const void *p2)
+{
+	const struct split_prio *tmp1 = p1;
+	const struct split_prio *tmp2 = p2;
+
+	if (tmp1->bs > tmp2->bs)
+		return 1;
+	if (tmp1->bs < tmp2->bs)
+		return -1;
+	return 0;
+}
+
+int split_parse_prio_ddir(struct thread_options *o, struct split_prio **entries,
+			  int *nr_entries, char *str)
+{
+	struct split_prio *tmp_entries;
+	unsigned int nr_bssplits;
+	char *str_cpy, *p, *fname;
+
+	/* strsep modifies the string, dup it so that we can use strsep twice */
+	p = str_cpy = strdup(str);
+	if (!p)
+		return 1;
+
+	nr_bssplits = 0;
+	while ((fname = strsep(&str_cpy, ":")) != NULL) {
+		if (!strlen(fname))
+			break;
+		nr_bssplits++;
+	}
+	free(p);
+
+	if (nr_bssplits > BSSPLIT_MAX) {
+		log_err("fio: too many cmdprio_bssplit entries\n");
+		return 1;
+	}
+
+	tmp_entries = calloc(nr_bssplits, sizeof(*tmp_entries));
+	if (!tmp_entries)
+		return 1;
+
+	nr_bssplits = 0;
+	while ((fname = strsep(&str, ":")) != NULL) {
+		struct split_prio *entry;
+
+		if (!strlen(fname))
+			break;
+
+		entry = &tmp_entries[nr_bssplits];
+
+		if (parse_cmdprio_bssplit_entry(o, entry, fname)) {
+			log_err("fio: failed to parse cmdprio_bssplit entry\n");
+			free(tmp_entries);
+			return 1;
+		}
+
+		/* skip zero perc entries, they provide no useful information */
+		if (entry->perc)
+			nr_bssplits++;
+	}
+
+	qsort(tmp_entries, nr_bssplits, sizeof(*tmp_entries),
+	      fio_split_prio_cmp);
+
+	*entries = tmp_entries;
+	*nr_entries = nr_bssplits;
+
+	return 0;
 }
 
 static int str2error(char *str)
@@ -513,7 +627,7 @@ static int str_exitall_cb(void)
 int fio_cpus_split(os_cpu_mask_t *mask, unsigned int cpu_index)
 {
 	unsigned int i, index, cpus_in_mask;
-	const long max_cpu = cpus_online();
+	const long max_cpu = cpus_configured();
 
 	cpus_in_mask = fio_cpu_count(mask);
 	if (!cpus_in_mask)
@@ -552,7 +666,7 @@ static int str_cpumask_cb(void *data, unsigned long long *val)
 		return 1;
 	}
 
-	max_cpu = cpus_online();
+	max_cpu = cpus_configured();
 
 	for (i = 0; i < sizeof(int) * 8; i++) {
 		if ((1 << i) & *val) {
@@ -588,7 +702,7 @@ static int set_cpus_allowed(struct thread_data *td, os_cpu_mask_t *mask,
 	strip_blank_front(&str);
 	strip_blank_end(str);
 
-	max_cpu = cpus_online();
+	max_cpu = cpus_configured();
 
 	while ((cpu = strsep(&str, ",")) != NULL) {
 		char *str2, *cpu2;
@@ -906,8 +1020,8 @@ static int str_sfr_cb(void *data, const char *str)
 }
 #endif
 
-static int zone_split_ddir(struct thread_options *o, enum fio_ddir ddir,
-			   char *str, bool absolute)
+static int zone_split_ddir(struct thread_options *o, void *eo,
+			   enum fio_ddir ddir, char *str, bool absolute)
 {
 	unsigned int i, perc, perc_missing, sperc, sperc_missing;
 	struct split split;
@@ -1012,7 +1126,7 @@ static int parse_zoned_distribution(struct thread_data *td, const char *input,
 	}
 	str += strlen(pre);
 
-	ret = str_split_parse(td, str, zone_split_ddir, absolute);
+	ret = str_split_parse(td, str, zone_split_ddir, NULL, absolute);
 
 	free(p);
 
@@ -1252,7 +1366,7 @@ int get_max_str_idx(char *input)
 }
 
 /*
- * Returns the directory at the index, indexes > entires will be
+ * Returns the directory at the index, indexes > entries will be
  * assigned via modulo division of the index
  */
 int set_name_idx(char *target, size_t tlen, char *input, int index,
@@ -1374,8 +1488,8 @@ static int str_buffer_pattern_cb(void *data, const char *input)
 	int ret;
 
 	/* FIXME: for now buffer pattern does not support formats */
-	ret = parse_and_fill_pattern(input, strlen(input), td->o.buffer_pattern,
-				     MAX_PATTERN_SIZE, NULL, NULL, NULL);
+	ret = parse_and_fill_pattern_alloc(input, strlen(input),
+				&td->o.buffer_pattern, NULL, NULL, NULL);
 	if (ret < 0)
 		return 1;
 
@@ -1423,9 +1537,9 @@ static int str_verify_pattern_cb(void *data, const char *input)
 	int ret;
 
 	td->o.verify_fmt_sz = FIO_ARRAY_SIZE(td->o.verify_fmt);
-	ret = parse_and_fill_pattern(input, strlen(input), td->o.verify_pattern,
-				     MAX_PATTERN_SIZE, fmt_desc,
-				     td->o.verify_fmt, &td->o.verify_fmt_sz);
+	ret = parse_and_fill_pattern_alloc(input, strlen(input),
+			&td->o.verify_pattern, fmt_desc, td->o.verify_fmt,
+			&td->o.verify_fmt_sz);
 	if (ret < 0)
 		return 1;
 
@@ -1446,7 +1560,7 @@ static int str_gtod_reduce_cb(void *data, int *il)
 	int val = *il;
 
 	/*
-	 * Only modfiy options if gtod_reduce==1
+	 * Only modify options if gtod_reduce==1
 	 * Otherwise leave settings alone.
 	 */
 	if (val) {
@@ -1833,6 +1947,10 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 			    .oval = TD_DDIR_TRIMWRITE,
 			    .help = "Trim and write mix, trims preceding writes"
 			  },
+			  { .ival = "randtrimwrite",
+			    .oval = TD_DDIR_RANDTRIMWRITE,
+			    .help = "Randomly trim and write mix, trims preceding writes"
+			  },
 		},
 	},
 	{
@@ -2024,6 +2142,16 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 #ifdef CONFIG_DFS
 			  { .ival = "dfs",
 			    .help = "DAOS File System (dfs) IO engine",
+			  },
+#endif
+#ifdef CONFIG_LIBNFS
+			  { .ival = "nfs",
+			    .help = "NFS IO engine",
+			  },
+#endif
+#ifdef CONFIG_LIBXNVME
+			  { .ival = "xnvme",
+			    .help = "XNVME IO engine",
 			  },
 #endif
 		},
@@ -3488,6 +3616,16 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.group	= FIO_OPT_G_INVALID,
 	},
 	{
+		.name	= "ignore_zone_limits",
+		.lname	= "Ignore zone resource limits",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct thread_options, ignore_zone_limits),
+		.def	= "0",
+		.help	= "Ignore the zone resource limits (max open/active zones) reported by the device",
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_INVALID,
+	},
+	{
 		.name	= "zone_reset_threshold",
 		.lname	= "Zone reset threshold",
 		.help	= "Zoned block device reset threshold",
@@ -3672,6 +3810,20 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 			  },
 		},
 		.parent = "thinktime",
+	},
+	{
+		.name	= "thinktime_iotime",
+		.lname	= "Thinktime interval",
+		.type	= FIO_OPT_INT,
+		.off1	= offsetof(struct thread_options, thinktime_iotime),
+		.help	= "IO time interval between 'thinktime'",
+		.def	= "0",
+		.parent	= "thinktime",
+		.hide	= 1,
+		.is_seconds = 1,
+		.is_time = 1,
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_THINKTIME,
 	},
 	{
 		.name	= "rate",
@@ -4224,6 +4376,18 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.group	= FIO_OPT_G_INVALID,
 	},
 	{
+		.name	= "log_entries",
+		.lname	= "Log entries",
+		.type	= FIO_OPT_INT,
+		.off1	= offsetof(struct thread_options, log_entries),
+		.help	= "Initial number of entries in a job IO log",
+		.def	= __fio_stringify(DEF_LOG_ENTRIES),
+		.minval	= DEF_LOG_ENTRIES,
+		.maxval	= MAX_LOG_ENTRIES,
+		.category = FIO_OPT_C_LOG,
+		.group	= FIO_OPT_G_INVALID,
+	},
+	{
 		.name	= "log_avg_msec",
 		.lname	= "Log averaging (msec)",
 		.type	= FIO_OPT_INT,
@@ -4281,6 +4445,16 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.type	= FIO_OPT_BOOL,
 		.off1	= offsetof(struct thread_options, log_offset),
 		.help	= "Include offset of IO for each log entry",
+		.def	= "0",
+		.category = FIO_OPT_C_LOG,
+		.group	= FIO_OPT_G_INVALID,
+	},
+	{
+		.name	= "log_prio",
+		.lname	= "Log priority of IO",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct thread_options, log_prio),
+		.help	= "Include priority value of IO for each log entry",
 		.def	= "0",
 		.category = FIO_OPT_C_LOG,
 		.group	= FIO_OPT_G_INVALID,
@@ -4346,6 +4520,24 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.type = FIO_OPT_BOOL,
 		.off1 = offsetof(struct thread_options, log_unix_epoch),
 		.help = "Use Unix time in log files",
+		.category = FIO_OPT_C_LOG,
+		.group = FIO_OPT_G_INVALID,
+	},
+	{
+		.name = "log_alternate_epoch",
+		.lname = "Log epoch alternate",
+		.type = FIO_OPT_BOOL,
+		.off1 = offsetof(struct thread_options, log_alternate_epoch),
+		.help = "Use alternate epoch time in log files. Uses the same epoch as that is used by clock_gettime with specified log_alternate_epoch_clock_id.",
+		.category = FIO_OPT_C_LOG,
+		.group = FIO_OPT_G_INVALID,
+	},
+	{
+		.name = "log_alternate_epoch_clock_id",
+		.lname = "Log alternate epoch clock_id",
+		.type = FIO_OPT_INT,
+		.off1 = offsetof(struct thread_options, log_alternate_epoch_clock_id),
+		.help = "If log_alternate_epoch or log_unix_epoch is true, this option specifies the clock_id from clock_gettime whose epoch should be used. If neither of those is true, this option has no effect. Default value is 0, or CLOCK_REALTIME",
 		.category = FIO_OPT_C_LOG,
 		.group = FIO_OPT_G_INVALID,
 	},
@@ -4479,6 +4671,50 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.minval	= 0,
 		.help	= "Percentage of buffers that are dedupable",
 		.interval = 1,
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_IO_BUF,
+	},
+	{
+		.name	= "dedupe_global",
+		.lname	= "Global deduplication",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct thread_options, dedupe_global),
+		.help	= "Share deduplication buffers across jobs",
+		.def	= "0",
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_IO_BUF,
+	},
+	{
+		.name	= "dedupe_mode",
+		.lname	= "Dedupe mode",
+		.help	= "Mode for the deduplication buffer generation",
+		.type	= FIO_OPT_STR,
+		.off1	= offsetof(struct thread_options, dedupe_mode),
+		.parent	= "dedupe_percentage",
+		.def	= "repeat",
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_IO_BUF,
+		.posval	= {
+			   { .ival = "repeat",
+			     .oval = DEDUPE_MODE_REPEAT,
+			     .help = "repeat previous page",
+			   },
+			   { .ival = "working_set",
+			     .oval = DEDUPE_MODE_WORKING_SET,
+			     .help = "choose a page randomly from limited working set defined in dedupe_working_set_percentage",
+			   },
+		},
+	},
+	{
+		.name	= "dedupe_working_set_percentage",
+		.lname	= "Dedupe working set percentage",
+		.help	= "Dedupe working set size in percentages from file or device size used to generate dedupe patterns from",
+		.type	= FIO_OPT_INT,
+		.off1	= offsetof(struct thread_options, dedupe_working_set_percentage),
+		.parent	= "dedupe_percentage",
+		.def	= "5",
+		.maxval	= 100,
+		.minval	= 0,
 		.category = FIO_OPT_C_IO,
 		.group	= FIO_OPT_G_IO_BUF,
 	},
@@ -5069,7 +5305,7 @@ void fio_keywords_init(void)
 	sprintf(buf, "%llu", mb_memory);
 	fio_keywords[1].replace = strdup(buf);
 
-	l = cpus_online();
+	l = cpus_configured();
 	sprintf(buf, "%lu", l);
 	fio_keywords[2].replace = strdup(buf);
 }

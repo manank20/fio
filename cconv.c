@@ -48,14 +48,24 @@ static void free_thread_options_to_cpu(struct thread_options *o)
 	free(o->profile);
 	free(o->cgroup);
 
+	free(o->verify_pattern);
+	free(o->buffer_pattern);
+
 	for (i = 0; i < DDIR_RWDIR_CNT; i++) {
 		free(o->bssplit[i]);
 		free(o->zone_split[i]);
 	}
 }
 
-void convert_thread_options_to_cpu(struct thread_options *o,
-				   struct thread_options_pack *top)
+size_t thread_options_pack_size(struct thread_options *o)
+{
+	return sizeof(struct thread_options_pack) + o->verify_pattern_bytes +
+		o->buffer_pattern_bytes;
+}
+
+int convert_thread_options_to_cpu(struct thread_options *o,
+				  struct thread_options_pack *top,
+				  size_t top_sz)
 {
 	int i, j;
 
@@ -171,10 +181,21 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	o->verify_interval = le32_to_cpu(top->verify_interval);
 	o->verify_offset = le32_to_cpu(top->verify_offset);
 
-	memcpy(o->verify_pattern, top->verify_pattern, MAX_PATTERN_SIZE);
-	memcpy(o->buffer_pattern, top->buffer_pattern, MAX_PATTERN_SIZE);
-
 	o->verify_pattern_bytes = le32_to_cpu(top->verify_pattern_bytes);
+	o->buffer_pattern_bytes = le32_to_cpu(top->buffer_pattern_bytes);
+	if (o->verify_pattern_bytes >= MAX_PATTERN_SIZE ||
+	    o->buffer_pattern_bytes >= MAX_PATTERN_SIZE ||
+	    thread_options_pack_size(o) > top_sz)
+		return -EINVAL;
+
+	o->verify_pattern = realloc(o->verify_pattern,
+				    o->verify_pattern_bytes);
+	o->buffer_pattern = realloc(o->buffer_pattern,
+				    o->buffer_pattern_bytes);
+	memcpy(o->verify_pattern, top->patterns, o->verify_pattern_bytes);
+	memcpy(o->buffer_pattern, &top->patterns[o->verify_pattern_bytes],
+	       o->buffer_pattern_bytes);
+
 	o->verify_fatal = le32_to_cpu(top->verify_fatal);
 	o->verify_dump = le32_to_cpu(top->verify_dump);
 	o->verify_async = le32_to_cpu(top->verify_async);
@@ -187,14 +208,18 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	o->rand_repeatable = le32_to_cpu(top->rand_repeatable);
 	o->allrand_repeatable = le32_to_cpu(top->allrand_repeatable);
 	o->rand_seed = le64_to_cpu(top->rand_seed);
+	o->log_entries = le32_to_cpu(top->log_entries);
 	o->log_avg_msec = le32_to_cpu(top->log_avg_msec);
 	o->log_hist_msec = le32_to_cpu(top->log_hist_msec);
 	o->log_hist_coarseness = le32_to_cpu(top->log_hist_coarseness);
 	o->log_max = le32_to_cpu(top->log_max);
 	o->log_offset = le32_to_cpu(top->log_offset);
+	o->log_prio = le32_to_cpu(top->log_prio);
 	o->log_gz = le32_to_cpu(top->log_gz);
 	o->log_gz_store = le32_to_cpu(top->log_gz_store);
 	o->log_unix_epoch = le32_to_cpu(top->log_unix_epoch);
+	o->log_alternate_epoch = le32_to_cpu(top->log_alternate_epoch);
+	o->log_alternate_epoch_clock_id = le32_to_cpu(top->log_alternate_epoch_clock_id);
 	o->norandommap = le32_to_cpu(top->norandommap);
 	o->softrandommap = le32_to_cpu(top->softrandommap);
 	o->bs_unaligned = le32_to_cpu(top->bs_unaligned);
@@ -213,6 +238,7 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	o->thinktime_spin = le32_to_cpu(top->thinktime_spin);
 	o->thinktime_blocks = le32_to_cpu(top->thinktime_blocks);
 	o->thinktime_blocks_type = le32_to_cpu(top->thinktime_blocks_type);
+	o->thinktime_iotime = le32_to_cpu(top->thinktime_iotime);
 	o->fsync_blocks = le32_to_cpu(top->fsync_blocks);
 	o->fdatasync_blocks = le32_to_cpu(top->fdatasync_blocks);
 	o->barrier_blocks = le32_to_cpu(top->barrier_blocks);
@@ -231,6 +257,8 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	o->zone_capacity = le64_to_cpu(top->zone_capacity);
 	o->zone_skip = le64_to_cpu(top->zone_skip);
 	o->zone_mode = le32_to_cpu(top->zone_mode);
+	o->max_open_zones = __le32_to_cpu(top->max_open_zones);
+	o->ignore_zone_limits = le32_to_cpu(top->ignore_zone_limits);
 	o->lockmem = le64_to_cpu(top->lockmem);
 	o->offset_increment_percent = le32_to_cpu(top->offset_increment_percent);
 	o->offset_increment = le64_to_cpu(top->offset_increment);
@@ -261,7 +289,6 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	o->zero_buffers = le32_to_cpu(top->zero_buffers);
 	o->refill_buffers = le32_to_cpu(top->refill_buffers);
 	o->scramble_buffers = le32_to_cpu(top->scramble_buffers);
-	o->buffer_pattern_bytes = le32_to_cpu(top->buffer_pattern_bytes);
 	o->time_based = le32_to_cpu(top->time_based);
 	o->disable_lat = le32_to_cpu(top->disable_lat);
 	o->disable_clat = le32_to_cpu(top->disable_clat);
@@ -296,6 +323,9 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	o->compress_percentage = le32_to_cpu(top->compress_percentage);
 	o->compress_chunk = le32_to_cpu(top->compress_chunk);
 	o->dedupe_percentage = le32_to_cpu(top->dedupe_percentage);
+	o->dedupe_mode = le32_to_cpu(top->dedupe_mode);
+	o->dedupe_working_set_percentage = le32_to_cpu(top->dedupe_working_set_percentage);
+	o->dedupe_global = le32_to_cpu(top->dedupe_global);
 	o->block_error_hist = le32_to_cpu(top->block_error_hist);
 	o->replay_align = le32_to_cpu(top->replay_align);
 	o->replay_scale = le32_to_cpu(top->replay_scale);
@@ -324,6 +354,8 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	uint8_t verify_cpumask[FIO_TOP_STR_MAX];
 	uint8_t log_gz_cpumask[FIO_TOP_STR_MAX];
 #endif
+
+	return 0;
 }
 
 void convert_thread_options_to_net(struct thread_options_pack *top,
@@ -410,12 +442,16 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->rand_repeatable = cpu_to_le32(o->rand_repeatable);
 	top->allrand_repeatable = cpu_to_le32(o->allrand_repeatable);
 	top->rand_seed = __cpu_to_le64(o->rand_seed);
+	top->log_entries = cpu_to_le32(o->log_entries);
 	top->log_avg_msec = cpu_to_le32(o->log_avg_msec);
 	top->log_max = cpu_to_le32(o->log_max);
 	top->log_offset = cpu_to_le32(o->log_offset);
+	top->log_prio = cpu_to_le32(o->log_prio);
 	top->log_gz = cpu_to_le32(o->log_gz);
 	top->log_gz_store = cpu_to_le32(o->log_gz_store);
 	top->log_unix_epoch = cpu_to_le32(o->log_unix_epoch);
+	top->log_alternate_epoch = cpu_to_le32(o->log_alternate_epoch);
+	top->log_alternate_epoch_clock_id = cpu_to_le32(o->log_alternate_epoch_clock_id);
 	top->norandommap = cpu_to_le32(o->norandommap);
 	top->softrandommap = cpu_to_le32(o->softrandommap);
 	top->bs_unaligned = cpu_to_le32(o->bs_unaligned);
@@ -434,6 +470,7 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->thinktime_spin = cpu_to_le32(o->thinktime_spin);
 	top->thinktime_blocks = cpu_to_le32(o->thinktime_blocks);
 	top->thinktime_blocks_type = __cpu_to_le32(o->thinktime_blocks_type);
+	top->thinktime_iotime = __cpu_to_le32(o->thinktime_iotime);
 	top->fsync_blocks = cpu_to_le32(o->fsync_blocks);
 	top->fdatasync_blocks = cpu_to_le32(o->fdatasync_blocks);
 	top->barrier_blocks = cpu_to_le32(o->barrier_blocks);
@@ -497,6 +534,9 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->compress_percentage = cpu_to_le32(o->compress_percentage);
 	top->compress_chunk = cpu_to_le32(o->compress_chunk);
 	top->dedupe_percentage = cpu_to_le32(o->dedupe_percentage);
+	top->dedupe_mode = cpu_to_le32(o->dedupe_mode);
+	top->dedupe_working_set_percentage = cpu_to_le32(o->dedupe_working_set_percentage);
+	top->dedupe_global = cpu_to_le32(o->dedupe_global);
 	top->block_error_hist = cpu_to_le32(o->block_error_hist);
 	top->replay_align = cpu_to_le32(o->replay_align);
 	top->replay_scale = cpu_to_le32(o->replay_scale);
@@ -554,8 +594,9 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 		top->max_latency[i] = __cpu_to_le64(o->max_latency[i]);
 	}
 
-	memcpy(top->verify_pattern, o->verify_pattern, MAX_PATTERN_SIZE);
-	memcpy(top->buffer_pattern, o->buffer_pattern, MAX_PATTERN_SIZE);
+	memcpy(top->patterns, o->verify_pattern, o->verify_pattern_bytes);
+	memcpy(&top->patterns[o->verify_pattern_bytes], o->buffer_pattern,
+	       o->buffer_pattern_bytes);
 
 	top->size = __cpu_to_le64(o->size);
 	top->io_size = __cpu_to_le64(o->io_size);
@@ -573,6 +614,8 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->zone_capacity = __cpu_to_le64(o->zone_capacity);
 	top->zone_skip = __cpu_to_le64(o->zone_skip);
 	top->zone_mode = __cpu_to_le32(o->zone_mode);
+	top->max_open_zones = __cpu_to_le32(o->max_open_zones);
+	top->ignore_zone_limits = cpu_to_le32(o->ignore_zone_limits);
 	top->lockmem = __cpu_to_le64(o->lockmem);
 	top->ddir_seq_add = __cpu_to_le64(o->ddir_seq_add);
 	top->file_size_low = __cpu_to_le64(o->file_size_low);
@@ -600,7 +643,6 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	uint8_t verify_cpumask[FIO_TOP_STR_MAX];
 	uint8_t log_gz_cpumask[FIO_TOP_STR_MAX];
 #endif
-
 }
 
 /*
@@ -610,18 +652,36 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
  */
 int fio_test_cconv(struct thread_options *__o)
 {
-	struct thread_options o;
-	struct thread_options_pack top1, top2;
+	struct thread_options o1 = *__o, o2;
+	struct thread_options_pack *top1, *top2;
+	size_t top_sz;
+	int ret;
 
-	memset(&top1, 0, sizeof(top1));
-	memset(&top2, 0, sizeof(top2));
+	o1.verify_pattern_bytes = 61;
+	o1.verify_pattern = malloc(o1.verify_pattern_bytes);
+	memset(o1.verify_pattern, 'V', o1.verify_pattern_bytes);
+	o1.buffer_pattern_bytes = 15;
+	o1.buffer_pattern = malloc(o1.buffer_pattern_bytes);
+	memset(o1.buffer_pattern, 'B', o1.buffer_pattern_bytes);
 
-	convert_thread_options_to_net(&top1, __o);
-	memset(&o, 0, sizeof(o));
-	convert_thread_options_to_cpu(&o, &top1);
-	convert_thread_options_to_net(&top2, &o);
+	top_sz = thread_options_pack_size(&o1);
+	top1 = calloc(1, top_sz);
+	top2 = calloc(1, top_sz);
 
-	free_thread_options_to_cpu(&o);
+	convert_thread_options_to_net(top1, &o1);
+	memset(&o2, 0, sizeof(o2));
+	ret = convert_thread_options_to_cpu(&o2, top1, top_sz);
+	if (ret)
+		goto out;
 
-	return memcmp(&top1, &top2, sizeof(top1));
+	convert_thread_options_to_net(top2, &o2);
+	ret = memcmp(top1, top2, top_sz);
+
+out:
+	free_thread_options_to_cpu(&o2);
+	free(top2);
+	free(top1);
+	free(o1.buffer_pattern);
+	free(o1.verify_pattern);
+	return ret;
 }
