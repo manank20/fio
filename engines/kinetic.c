@@ -15,6 +15,7 @@
  */
 #include <pthread.h>
 #include <time.h>
+#include <math.h>
 #include "fio.h"
 #include "verify.h"
 #include "../optgroup.h"
@@ -922,6 +923,14 @@ fio_kinetic_cleanup(struct thread_data *td)
 		if (ki_getstats(ktd, kd->kd_kst) != K_OK) {
 			printf("Statistics failed\n");
 		}
+
+		if (prhdr) {
+			printf("N nQSize, Mean QSize, StdDev QSize, \n");
+		}
+		printf("%lu, %g, %g\n",	
+			kd->kd_kst->kst_qsn, 
+			kd->kd_kst->kst_qsm, 
+			sqrt(kd->kd_kst->kst_qsms/(kd->kd_kst->kst_qsn -1)));
 
 		if (prhdr) {
 			printf("Job, BS, OK, %%, ");
