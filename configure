@@ -317,7 +317,6 @@ if test "$show_help" = "yes" ; then
   echo "--disable-dfs           Disable DAOS File System support even if found"
   echo "--enable-asan           Enable address sanitizer"
   echo "--seed-buckets=         Number of seed buckets for the refill-buffer"
->>>>>>> upstream/master
   exit $exit_val
 fi
 

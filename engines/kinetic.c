@@ -924,6 +924,7 @@ fio_kinetic_cleanup(struct thread_data *td)
 			printf("Statistics failed\n");
 		}
 
+#if 0
 		if (prhdr) {
 			printf("N nQSize, Mean QSize, StdDev QSize, \n");
 		}
@@ -931,6 +932,7 @@ fio_kinetic_cleanup(struct thread_data *td)
 			kd->kd_kst->kst_qsn, 
 			kd->kd_kst->kst_qsm, 
 			sqrt(kd->kd_kst->kst_qsms/(kd->kd_kst->kst_qsn -1)));
+#endif
 
 		if (prhdr) {
 			printf("Job, BS, OK, %%, ");
