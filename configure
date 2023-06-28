@@ -2011,13 +2011,13 @@ int main(int argc, char **argv)
         return(s?0:1);
 }
 EOF
-_KINULDLIBS="-Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto"
+_KINULDLIBS="-Wl,-Bstatic -lkinetic -Wl,-Bdynamic -luring -lpthread -lssl -lcrypto"
 _KINULDFLAGS="-L/opt/kinetic-uring/build/lib"
 _KINUCFLAGS="-I/opt/kinetic-uring/build/include"
 if compile_prog "$_KINUCFLAGS" "$_KINULDFLAGS $_KINULDLIBS" "kinetic-uring"; then
   kinetic_uring="yes"
 fi
-print_config "Kinetic-uring engine" "$kinetic"
+print_config "Kinetic-uring engine" "$kinetic_uring"
 
 ##########################################
 # check for rbd_invalidate_cache()

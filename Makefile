@@ -240,7 +240,7 @@ ifdef CONFIG_KINETIC_SOCKETS
 endif
 ifdef CONFIG_KINETIC_URING
   kinetic-uring_SRCS = engines/kinetic.c
-  kinetic-uring_LIBS = -Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto
+  kinetic-uring_LIBS = -Wl,-Bstatic -lkinetic -Wl,-Bdynamic -luring -lpthread -lssl -lcrypto
   ENGINES += kinetic-uring
   LDFLAGS += -L/opt/kinetic-uring/build/lib
   CFLAGS  += -I/opt/kinetic-uring/build/include
