@@ -1985,9 +1985,9 @@ int main(int argc, char **argv)
         return(s?0:1);
 }
 EOF
-_KINLDLIBS="-Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto"
-_KINLDFLAGS="-L/opt/kinetic/lib"
-_KINCFLAGS="-I/opt/kinetic/include"
+_KINLDLIBS="-Wl,-Bstatic -lkinetic -luring -Wl,-Bdynamic -lpthread -lssl -lcrypto"
+_KINLDFLAGS="-L/opt/kinetic/build/lib"
+_KINCFLAGS="-I/opt/kinetic/build/include"
 if compile_prog "$_KINCFLAGS" "$_KINLDFLAGS $_KINLDLIBS" "kinetic"; then
   kinetic="yes"
 fi

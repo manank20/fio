@@ -233,10 +233,10 @@ ifdef CONFIG_LIBZBC
 endif
 ifdef CONFIG_KINETIC
   kinetic_SRCS = engines/kinetic.c
-  kinetic_LIBS = -Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto
+  kinetic_LIBS = -Wl,-Bstatic -lkinetic -luring -Wl,-Bdynamic -lpthread -lssl -lcrypto
   ENGINES += kinetic
-  LDFLAGS += -L/opt/kinetic/lib
-  CFLAGS  += -I/opt/kinetic/include
+  LDFLAGS += -L/opt/kinetic/build/lib
+  CFLAGS  += -I/opt/kinetic/build/include
 endif
 ifdef CONFIG_LIBXNVME
   xnvme_SRCS = engines/xnvme.c
