@@ -231,19 +231,12 @@ ifdef CONFIG_LIBZBC
   libzbc_LIBS = -lzbc
   ENGINES += libzbc
 endif
-ifdef CONFIG_KINETIC_SOCKETS
-  kinetic-sockets_SRCS = engines/kinetic.c
-  kinetic-sockets_LIBS = -Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto
-  ENGINES += kinetic-sockets
-  LDFLAGS += -L/opt/kinetic-sockets/build/lib
-  CFLAGS  += -I/opt/kinetic-sockets/build/include
-endif
-ifdef CONFIG_KINETIC_URING
-  kinetic-uring_SRCS = engines/kinetic.c
-  kinetic-uring_LIBS = -Wl,-Bstatic -lkinetic -Wl,-Bdynamic -luring -lpthread -lssl -lcrypto
-  ENGINES += kinetic-uring
-  LDFLAGS += -L/opt/kinetic-uring/build/lib
-  CFLAGS  += -I/opt/kinetic-uring/build/include
+ifdef CONFIG_KINETIC
+  kinetic_SRCS = engines/kinetic.c
+  kinetic_LIBS = -Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto
+  ENGINES += kinetic
+  LDFLAGS += -L/opt/kinetic/lib
+  CFLAGS  += -I/opt/kinetic/include
 endif
 ifdef CONFIG_LIBXNVME
   xnvme_SRCS = engines/xnvme.c

@@ -247,9 +247,7 @@ for opt do
   ;;
   --disable-libzbc) libzbc="no"
   ;;
-  --disable-kinetic-uring) kinetic_uring="no"
-  ;;
-  --disable-kinetic-sockets) kinetic_sockets="no"
+  --disable-kinetic) kinetic="no"
   ;;
   --disable-xnvme) xnvme="no"
   ;;
@@ -280,46 +278,45 @@ for opt do
 done
 
 if test "$show_help" = "yes" ; then
-  echo "--prefix=                         Use this directory as installation prefix"
-  echo "--cpu=                            Specify target CPU if auto-detect fails"
-  echo "--cc=                             Specify compiler to use"
-  echo "--extra-cflags=                   Specify extra CFLAGS to pass to compiler"
-  echo "--build-32bit-win                 Enable 32-bit build on Windows"
-  echo "--target-win-ver=                 Minimum version of Windows to target (only accepts 7)"
-  echo "--enable-pdb                      Enable Windows PDB symbols generation (needs clang/lld)"
-  echo "--build-static                    Build a static fio"
-  echo "--esx                             Configure build options for esx"
-  echo "--enable-gfio                     Enable building of gtk gfio"
-  echo "--disable-numa                    Disable libnuma even if found"
-  echo "--disable-rdma                    Disable RDMA support even if found"
-  echo "--disable-rados                   Disable Rados support even if found"
-  echo "--disable-rbd                     Disable Rados Block Device even if found"
-  echo "--disable-http                    Disable HTTP support even if found"
-  echo "--disable-gfapi                   Disable gfapi"
-  echo "--enable-libhdfs                  Enable hdfs support"
-  echo "--enable-libnfs                   Enable nfs support"
-  echo "--disable-libnfs                  Disable nfs support"
-  echo "--disable-lex                     Disable use of lex/yacc for math"
-  echo "--disable-pmem                    Disable pmem based engines even if found"
-  echo "--enable-lex                      Enable use of lex/yacc for math"
-  echo "--disable-shm                     Disable SHM support"
-  echo "--disable-optimizations           Don't enable compiler optimizations"
-  echo "--enable-cuda                     Enable GPUDirect RDMA support"
-  echo "--enable-libcufile                Enable GPUDirect Storage cuFile support"
-  echo "--disable-native                  Don't build for native host"
-  echo "--with-ime=                       Install path for DDN's Infinite Memory Engine"
-  echo "--enable-libiscsi                 Enable iscsi support"
-  echo "--enable-libnbd                   Enable libnbd (NBD engine) support"
-  echo "--disable-xnvme                   Disable xnvme support even if found"
-  echo "--disable-libblkio                Disable libblkio support even if found"
-  echo "--disable-libzbc                  Disable libzbc even if found"
-  echo "--disable-kinetic-uring           Disable kinetic-uring engine"
-  echo "--disable-kinetic-sockets         Disable kinetic-sockets engine"
-  echo "--disable-tcmalloc                Disable tcmalloc support"
-  echo "--dynamic-libengines              Lib-based ioengines as dynamic libraries"
-  echo "--disable-dfs                     Disable DAOS File System support even if found"
-  echo "--enable-asan                     Enable address sanitizer"
-  echo "--seed-buckets=                   Number of seed buckets for the refill-buffer"
+  echo "--prefix=               Use this directory as installation prefix"
+  echo "--cpu=                  Specify target CPU if auto-detect fails"
+  echo "--cc=                   Specify compiler to use"
+  echo "--extra-cflags=         Specify extra CFLAGS to pass to compiler"
+  echo "--build-32bit-win       Enable 32-bit build on Windows"
+  echo "--target-win-ver=       Minimum version of Windows to target (only accepts 7)"
+  echo "--enable-pdb            Enable Windows PDB symbols generation (needs clang/lld)"
+  echo "--build-static          Build a static fio"
+  echo "--esx                   Configure build options for esx"
+  echo "--enable-gfio           Enable building of gtk gfio"
+  echo "--disable-numa          Disable libnuma even if found"
+  echo "--disable-rdma          Disable RDMA support even if found"
+  echo "--disable-rados         Disable Rados support even if found"
+  echo "--disable-rbd           Disable Rados Block Device even if found"
+  echo "--disable-http          Disable HTTP support even if found"
+  echo "--disable-gfapi         Disable gfapi"
+  echo "--enable-libhdfs        Enable hdfs support"
+  echo "--enable-libnfs         Enable nfs support"
+  echo "--disable-libnfs        Disable nfs support"
+  echo "--disable-lex           Disable use of lex/yacc for math"
+  echo "--disable-pmem          Disable pmem based engines even if found"
+  echo "--enable-lex            Enable use of lex/yacc for math"
+  echo "--disable-shm           Disable SHM support"
+  echo "--disable-optimizations Don't enable compiler optimizations"
+  echo "--enable-cuda           Enable GPUDirect RDMA support"
+  echo "--enable-libcufile      Enable GPUDirect Storage cuFile support"
+  echo "--disable-native        Don't build for native host"
+  echo "--with-ime=             Install path for DDN's Infinite Memory Engine"
+  echo "--enable-libiscsi       Enable iscsi support"
+  echo "--enable-libnbd         Enable libnbd (NBD engine) support"
+  echo "--disable-xnvme         Disable xnvme support even if found"
+  echo "--disable-libblkio      Disable libblkio support even if found"
+  echo "--disable-libzbc        Disable libzbc even if found"
+  echo "--disable-kinetic       Disable kinetic engine"
+  echo "--disable-tcmalloc      Disable tcmalloc support"
+  echo "--dynamic-libengines    Lib-based ioengines as dynamic libraries"
+  echo "--disable-dfs           Disable DAOS File System support even if found"
+  echo "--enable-asan           Enable address sanitizer"
+  echo "--seed-buckets=         Number of seed buckets for the refill-buffer"
   exit $exit_val
 fi
 
@@ -1974,9 +1971,9 @@ print_config "rbd_poll" "$rbd_poll"
 fi
 
 ##########################################
-# check for kinetic-sockets
-if test "$kinetic_sockets" != "yes" ; then
-  kinetic_sockets="no"
+# check for kinetic
+if test "$kinetic" != "yes" ; then
+  kinetic="no"
 fi
 
 cat > $TMPC << EOF
@@ -1988,36 +1985,13 @@ int main(int argc, char **argv)
         return(s?0:1);
 }
 EOF
-_KINSLDLIBS="-Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto"
-_KINSLDFLAGS="-L/opt/kinetic-sockets/build/lib"
-_KINSCFLAGS="-I/opt/kinetic-sockets/build/include"
-if compile_prog "$_KINSCFLAGS" "$_KINSLDFLAGS $_KINSLDLIBS" "kinetic-sockets"; then
-  kinetic_sockets="yes"
+_KINLDLIBS="-Wl,-Bstatic -lkinetic -Wl,-Bdynamic -lpthread -lssl -lcrypto"
+_KINLDFLAGS="-L/opt/kinetic/lib"
+_KINCFLAGS="-I/opt/kinetic/include"
+if compile_prog "$_KINCFLAGS" "$_KINLDFLAGS $_KINLDLIBS" "kinetic"; then
+  kinetic="yes"
 fi
-print_config "Kinetic-sockets engine" "$kinetic_sockets"
-
-##########################################
-# check for kinetic-uring
-if test "$kinetic_uring" != "yes" ; then
-  kinetic_uring="no"
-fi
-
-cat > $TMPC << EOF
-#include <kinetic/kinetic.h>
-int main(int argc, char **argv)
-{
-	extern char *ki_msgtype_label[];
-        char *s = ki_msgtype_label[0];
-        return(s?0:1);
-}
-EOF
-_KINULDLIBS="-Wl,-Bstatic -lkinetic -Wl,-Bdynamic -luring -lpthread -lssl -lcrypto"
-_KINULDFLAGS="-L/opt/kinetic-uring/build/lib"
-_KINUCFLAGS="-I/opt/kinetic-uring/build/include"
-if compile_prog "$_KINUCFLAGS" "$_KINULDFLAGS $_KINULDLIBS" "kinetic-uring"; then
-  kinetic_uring="yes"
-fi
-print_config "Kinetic-uring engine" "$kinetic_uring"
+print_config "Kinetic engine" "$kinetic"
 
 ##########################################
 # check for rbd_invalidate_cache()
@@ -3210,11 +3184,8 @@ fi
 if test "$rbd_poll" = "yes" ; then
   output_sym "CONFIG_RBD_POLL"
 fi
-if test "$kinetic_sockets" = "yes" ; then
-  output_sym "CONFIG_KINETIC_SOCKETS"
-fi
-if test "$kinetic_uring" = "yes" ; then
-  output_sym "CONFIG_KINETIC_URING"
+if test "$kinetic" = "yes" ; then
+  output_sym "CONFIG_KINETIC"
 fi
 if test "$rbd_inval" = "yes" ; then
   output_sym "CONFIG_RBD_INVAL"
